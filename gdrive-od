@@ -1,0 +1,3201 @@
+#!/usr/bin/env python3
+"""
+gdrive-od — Google Drive "Files On-Demand" for Linux (KDE/Dolphin), built on rclone.
+
+  * Every file in Drive shows up locally. Files not stored on disk are tiny
+    placeholders named  "<name>.gdcloud".
+  * Double-click a placeholder -> it downloads and opens.
+  * Right-click -> Google Drive -> "Make available offline" / "Free up space".
+  * Folders can be marked "always keep offline" (new files arrive downloaded).
+  * Google Docs/Sheets/Slides become .gdoc/.gsheet/.gslides links that open in the
+    browser profile configured for that account.
+  * Two-way sync: local edits, new files, renames/moves and deletes go up; remote
+    changes come down. Deletes go to the Drive trash / local trash (recoverable).
+  * Near-instant: the daemon sees local changes through inotify and Drive changes
+    through the Drive Changes API, and syncs only the affected folders. A full
+    reconciliation runs at start and every `full_sync_interval` as a safety net.
+  * Dolphin "Tags" column shows  Offline / Online only / Google file.
+
+Commands:
+  gdrive-od setup-desktop          install MIME types, Dolphin menu, systemd unit
+  gdrive-od add-account NAME --email ADDRESS   connect a Google account (sign-in, config, service)
+  gdrive-od sync [ACCOUNT...]      run one full sync now (all accounts if none given)
+  gdrive-od daemon ACCOUNT         live sync (systemd service); SIGUSR1 = full sync now
+  gdrive-od pin PATH...            make files/folders available offline
+  gdrive-od unpin PATH...          free up space (back to online-only)
+  gdrive-od open PATH              open a placeholder or Google file link
+  gdrive-od web PATH               open the item in Drive web (right profile)
+  gdrive-od status PATH...         show sync state
+  gdrive-od reconnect [ACCOUNT...] sign in to Google again (expired/revoked token)
+  gdrive-od backup pause|resume|now [ACCOUNT...]   control this PC's backup
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import datetime as dt
+import errno
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import sqlite3
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
+from dataclasses import astuple, dataclass, field, replace
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+VERSION = "0.2.0"
+STUB_EXT = ".gdcloud"
+TMP_EXT = ".gdod-part"
+GTYPE_EXT = {"document": ".gdoc", "spreadsheet": ".gsheet", "presentation": ".gslides",
+             "form": ".gform", "drawing": ".gdraw", "map": ".gmap", "site": ".gsite", "script": ".gscript"}
+LINK_EXTS = {*GTYPE_EXT.values(), ".glink"}
+TAG_OFFLINE, TAG_ONLINE, TAG_GOOGLE = "Offline", "Online only", "Google file"
+OUR_TAGS = {TAG_OFFLINE, TAG_ONLINE, TAG_GOOGLE}
+IGNORE_NAMES = {".directory", ".Trash-1000", ".DS_Store", "desktop.ini", "Thumbs.db"}
+IGNORE_PREFIX = (".~lock.", "~$", ".goutputstream-")
+IGNORE_SUFFIX = (TMP_EXT, ".part", ".crdownload", ".swp", ".swx", ".kate-swp", "~")
+
+HOME = Path.home()
+CONFIG_PATH = Path(os.environ.get("GDOD_CONFIG") or
+                   Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "gdrive-ondemand" / "config.toml")
+STATE_DIR = Path(os.environ.get("GDOD_STATE") or
+                 Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "gdrive-ondemand")
+RCLONE = os.environ.get("GDOD_RCLONE", "rclone")
+# desktop export => Google Docs appear in listings as "<name>.desktop" (tiny, no conversion).
+# Never prompt for a config password: the daemon has no terminal.
+BASE_FLAGS = ["--drive-export-formats", "desktop", "--ask-password=false"]
+LIST_FLAGS = ["--hash", "--hash-type", "md5", "-M"]
+DIR_NOT_FOUND = 3       # rclone exit code
+
+log = logging.getLogger("gdrive-od")
+
+
+# ───────────────────────────── config ─────────────────────────────
+@dataclass
+class Account:
+    name: str
+    remote: str
+    local: Path
+    email: str = ""
+    browser: list = field(default_factory=lambda: ["xdg-open"])
+    interval: int = 120                 # full-sync period when live change detection is unavailable
+    settle: int = 10
+    max_delete_pct: int = 50
+    rclone_args: list = field(default_factory=list)
+    poll_interval: float = 15           # Drive Changes API polling period
+    full_sync_interval: int = 1800      # safety-net full sync when live change detection works
+    sections: bool = False              # My Drive / Shared with me / Shared drives / Computers in `local`
+    shared_with_me: bool = True         # (sections) show "Shared with me"
+    shared_drives: object = "all"       # (sections) "all", a list of drive names, or [] for none
+    backup: list = field(default_factory=list)   # this PC's folders -> My Drive/Computers/<backup_name>/
+    backup_name: str = ""               # defaults to the host name
+    # set on the sync roots derived from a sections account (see sync_roots)
+    section: str = ""                   # "" plain account | my-drive | shared | drive
+    owner: str = ""                     # the [accounts.NAME] this root belongs to
+    label: str = ""                     # human-readable name for logs and notifications
+    ref: str = ""                       # Shared drive ID (section "drive")
+    exclude: list = field(default_factory=list)  # top-level paths left out (My Drive/Computers if backups)
+
+    @property
+    def title(self) -> str:
+        return self.label or self.name
+
+    def rpath(self, rel: str = "") -> str:
+        if not rel:
+            return self.remote
+        sep = "" if self.remote.endswith((":", "/")) else "/"
+        return self.remote + sep + rel
+
+    @property
+    def db_path(self) -> Path:
+        return STATE_DIR / f"{self.name}.db"
+
+    @property
+    def lock_path(self) -> Path:
+        return STATE_DIR / f"{self.name}.lock"
+
+
+def die(msg: str, code: int = 1):
+    log.error(msg)
+    notify("Google Drive", msg)
+    sys.exit(code)
+
+
+def load_config(required: bool = True) -> dict[str, Account]:
+    if not CONFIG_PATH.exists():
+        if not required:
+            return {}
+        die(f"No config at {CONFIG_PATH}. Add an account with 'gdrive-od add-account NAME --email ...'.")
+    data = tomllib.loads(CONFIG_PATH.read_text())
+    accs = {}
+    for name, a in data.get("accounts", {}).items():
+        accs[name] = Account(
+            name=name, remote=a["remote"],
+            local=Path(os.path.realpath(os.path.expanduser(a["local"]))),
+            email=a.get("email", ""), browser=list(a.get("browser", ["xdg-open"])),
+            interval=int(a.get("interval", 120)), settle=int(a.get("settle", 10)),
+            max_delete_pct=int(a.get("max_delete_pct", 50)),
+            rclone_args=list(a.get("rclone_args", [])),
+            poll_interval=float(a.get("poll_interval", 15)),
+            full_sync_interval=int(a.get("full_sync_interval", 1800)),
+            sections=bool(a.get("sections", False)), shared_with_me=bool(a.get("shared_with_me", True)),
+            shared_drives=a.get("shared_drives", "all"), backup=list(a.get("backup", [])),
+            backup_name=str(a.get("backup_name", "")))
+    if not accs and required:
+        die(f"No accounts in {CONFIG_PATH}. Add one with 'gdrive-od add-account NAME --email ...'.")
+    return accs
+
+
+def toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)        # a valid TOML basic string
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    raise TypeError(f"cannot write {v!r} to TOML")
+
+
+def config_set(account: str, key: str, value=None):
+    """Set `key` in [accounts.<account>] of the config (None removes it). Every other line,
+    comments included, stays as it is; a result that doesn't parse is never written."""
+    lines = CONFIG_PATH.read_text().splitlines()
+    header = re.compile(r"^\s*\[\s*accounts\s*\.\s*" + re.escape(account) + r"\s*\]\s*(#.*)?$")
+    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if start is None:
+        raise KeyError(f"no [accounts.{account}] in {CONFIG_PATH}")
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^\s*\[[^\]]*\]\s*(#.*)?$", lines[i])
+                and not re.match(r"^\s*\[\s*[\"'\d-]", lines[i])), len(lines))
+    found = None
+    for i in range(start + 1, end):
+        if re.match(r"^\s*" + re.escape(key) + r"\s*=", lines[i]):
+            j, depth = i, lines[i].split("#")[0].count("[") - lines[i].split("#")[0].count("]")
+            while depth > 0 and j + 1 < end:                # a multi-line array
+                j += 1
+                depth += lines[j].split("#")[0].count("[") - lines[j].split("#")[0].count("]")
+            found = (i, j)
+            break
+    new = [] if value is None else [f"{key} = {toml_value(value)}"]
+    if found:
+        lines[found[0]:found[1] + 1] = new
+    elif new:
+        k = end
+        while k > start + 1 and not lines[k - 1].strip():
+            k -= 1
+        lines[k:k] = new
+    text = "\n".join(lines) + "\n"
+    parsed = tomllib.loads(text).get("accounts", {}).get(account, {})
+    if parsed.get(key) != value:
+        raise ValueError(f"config edit of {account}.{key} did not round-trip")
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, CONFIG_PATH)
+
+
+# ───────────────────────────── sections ─────────────────────────────
+# With `sections = true` an account folder looks like the Drive website. Each section except
+# Computers is its own sync root with its own DB, lock and change feed; My Drive keeps the
+# account's original DB. Computers: Google lets only its "Drive for desktop" app create entries
+# there, so this PC's backups go to My Drive/Computers/<name>/ (left out of the My Drive sync) and
+# the local Computers folder holds links to the backed-up folders.
+MY_DRIVE, SHARED, DRIVES, COMPUTERS = "My Drive", "Shared with me", "Shared drives", "Computers"
+SECTION_ICONS = {MY_DRIVE: "folder-gdrive", SHARED: "folder-publicshare", DRIVES: "folder-network",
+                 COMPUTERS: "computer"}
+BACKUP_ROOT = "Computers"
+
+
+def drives_cache(acc: Account) -> Path:
+    return STATE_DIR / f"{acc.name}.drives.json"
+
+
+def refresh_shared_drives(acc: Account) -> list[dict]:
+    """The account's Shared drives ([{id, name}] from `rclone backend drives`), cached so that
+    Dolphin actions resolve paths without the network."""
+    try:
+        drives = [{"id": d["id"], "name": d["name"]}
+                  for d in json.loads(rclone(acc, "backend", "drives", acc.remote) or "[]")]
+    except (RuntimeError, ValueError, KeyError) as e:
+        log.warning("%s: cannot list Shared drives (%s); using the last known list", acc.name, e)
+        return cached_shared_drives(acc)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    drives_cache(acc).write_text(json.dumps(drives))
+    return drives
+
+
+def cached_shared_drives(acc: Account) -> list[dict]:
+    try:
+        return json.loads(drives_cache(acc).read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def sync_roots(acc: Account, refresh: bool = False) -> list[Account]:
+    """The sync roots of an account: itself, or with sections My Drive, Shared with me and one root
+    per Shared drive."""
+    if not acc.sections:
+        return [acc]
+    name = split_remote(acc.remote)[0]
+    roots = [replace(acc, local=acc.local / MY_DRIVE, section="my-drive", owner=acc.name,
+                     label=f"{acc.name} › {MY_DRIVE}", exclude=[BACKUP_ROOT] if acc.backup else [])]
+    if not name:                    # sections need a real rclone remote
+        return roots
+    if acc.shared_with_me:
+        roots.append(replace(acc, name=f"{acc.name}.shared", remote=f"{name},shared_with_me=true:",
+                             local=acc.local / SHARED, section="shared", owner=acc.name,
+                             label=f"{acc.name} › {SHARED}", backup=[]))
+    if acc.shared_drives:
+        wanted = None if acc.shared_drives == "all" else {str(w).strip() for w in acc.shared_drives}
+        used: set[str] = set()
+        for d in refresh_shared_drives(acc) if refresh else cached_shared_drives(acc):
+            title = d["name"].strip()
+            if wanted is not None and title not in wanted:
+                continue
+            folder = title.replace("/", "∕") or "Unnamed drive"
+            n = 2
+            while folder.casefold() in used:
+                folder = f"{title.replace('/', '∕')} ({n})"
+                n += 1
+            used.add(folder.casefold())
+            roots.append(replace(acc, name=f"{acc.name}.drive-{d['id']}", remote=f"{name},team_drive={d['id']}:",
+                                 local=acc.local / DRIVES / folder, section="drive", owner=acc.name,
+                                 label=f"{acc.name} › {title}", ref=d["id"], backup=[]))
+    return roots
+
+
+def all_roots(accs: dict[str, Account]) -> list[Account]:
+    """Every sync root, deepest folder first (so a Shared drive wins over its account folder)."""
+    return sorted((r for a in accs.values() for r in sync_roots(a)), key=lambda r: -len(r.local.parts))
+
+
+def migrate_to_sections(acc: Account):
+    """The v0.2 layout synced My Drive straight into `local`; with sections it lives in
+    `local`/My Drive. Two renames, nothing re-downloaded (paths in the DB are relative)."""
+    md, tmp = acc.local / MY_DRIVE, acc.local.with_name(acc.local.name + ".gdod-migrating")
+    with Locked(acc):
+        if tmp.exists() and not md.exists():                 # interrupted half way
+            acc.local.mkdir(parents=True, exist_ok=True)
+            os.rename(tmp, md)
+        elif not md.exists() and acc.local.is_dir() and acc.db_path.exists() and any(acc.local.iterdir()):
+            os.rename(acc.local, tmp)
+            acc.local.mkdir()
+            os.rename(tmp, md)
+        else:
+            return
+    log.info("%s: moved the synced My Drive into %s", acc.name, md)
+
+
+def prepare_layout(acc: Account):
+    """Section folders with their icons, and Computers/<this PC>/<folder> links to backed-up folders."""
+    if not acc.sections:
+        return
+    migrate_to_sections(acc)          # first: an empty "My Drive" made here would block the move
+    named = bool(split_remote(acc.remote)[0])        # Shared with me / Shared drives need an rclone remote
+    for sec, icon in SECTION_ICONS.items():
+        if sec == MY_DRIVE and not (acc.local / MY_DRIVE).is_dir() or sec == COMPUTERS and not acc.backup \
+                or sec == DRIVES and not (named and acc.shared_drives) \
+                or sec == SHARED and not (named and acc.shared_with_me):
+            continue                  # My Drive's folder is created by its first sync
+        set_folder_icon(acc.local / sec, icon)
+    set_folder_icon(acc.local, "folder-gdrive")
+    if acc.backup:
+        pc = acc.local / COMPUTERS / (acc.backup_name or socket.gethostname())
+        set_folder_icon(pc, "computer-laptop")
+        for src in acc.backup:
+            src = Path(os.path.realpath(os.path.expanduser(src)))
+            link = pc / src.name
+            if link.is_symlink() and Path(os.readlink(link)) != src:
+                link.unlink()
+            if not link.exists() and not link.is_symlink():
+                link.symlink_to(src, target_is_directory=True)
+
+
+# ───────────────────────────── helpers ─────────────────────────────
+_notified: dict[tuple, float] = {}
+
+
+def notify(summary: str, body: str = ""):
+    now = time.monotonic()
+    if now - _notified.get((summary, body), -1e9) < 600:      # the daemon repeats itself; don't spam
+        return
+    _notified[(summary, body)] = now
+    if shutil.which("notify-send") and os.environ.get("GDOD_NO_NOTIFY") is None:
+        subprocess.Popen(["notify-send", "-a", "Google Drive", "-i", "folder-cloud", summary, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def human(n: int) -> str:
+    f = float(max(n, 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024 or unit == "TB":
+            return f"{f:.0f} {unit}" if unit == "B" else f"{f:.1f} {unit}"
+        f /= 1024
+    return f"{n} B"
+
+
+def parse_time(s: str):
+    try:
+        s = s.replace("Z", "+00:00")
+        if "." in s:
+            head, rest = s.split(".", 1)
+            i = 0
+            while i < len(rest) and rest[i].isdigit():
+                i += 1
+            frac, tz = rest[:i][:6], rest[i:]
+            s = f"{head}.{frac}{tz}" if frac else head + tz
+        return dt.datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def ignored_name(n: str) -> bool:
+    return n in IGNORE_NAMES or n.startswith(IGNORE_PREFIX) or n.endswith(IGNORE_SUFFIX)
+
+
+def join(a: str, b: str) -> str:
+    return f"{a}/{b}" if a else b
+
+
+def parent(p: str) -> str:
+    return p.rsplit("/", 1)[0] if "/" in p else ""
+
+
+def under(p: str, prefix: str) -> bool:
+    return prefix == "" or p == prefix or p.startswith(prefix + "/")
+
+
+def lstat_or_none(fp: Path):
+    try:
+        return fp.lstat()
+    except OSError:
+        return None
+
+
+def rekey(m: dict, old: str, new: str):
+    """Move every entry (S rows or R items) at or below `old` to the same place below `new`."""
+    for k in [k for k in m if under(k, old)]:
+        v = m.pop(k)
+        nk = new + k[len(old):]
+        rn = new + v.rname[len(old):] if under(v.rname, old) else v.rname
+        m[nk] = replace(v, path=nk, rname=rn)
+
+
+def getx(fp: Path, key: str) -> str:
+    try:
+        return os.getxattr(fp, key).decode()
+    except OSError:
+        return ""
+
+
+def setx(fp: Path, key: str, val: str):
+    try:
+        os.setxattr(fp, key, val.encode())
+    except OSError:
+        pass
+
+
+def set_status_tag(fp: Path, tag: str):
+    """Dolphin shows user.xdg.tags in its 'Tags' column. Keep the user's own tags."""
+    cur = [t for t in getx(fp, "user.xdg.tags").split(",") if t]
+    new = [t for t in cur if t not in OUR_TAGS] + [tag]
+    if new != cur:
+        setx(fp, "user.xdg.tags", ",".join(new))
+
+
+def md5_file(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def trash_local(fp: Path, acc: Account):
+    if shutil.which("gio") and subprocess.run(["gio", "trash", str(fp)],
+                                              capture_output=True).returncode == 0:
+        return
+    if shutil.which("kioclient") and subprocess.run(["kioclient", "move", str(fp), "trash:/"],
+                                                    capture_output=True).returncode == 0:
+        return
+    dest = STATE_DIR / "trash" / acc.name / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(fp), dest / fp.name)
+
+
+class RcloneError(RuntimeError):
+    def __init__(self, msg: str, code: int):
+        super().__init__(msg)
+        self.code = code
+
+
+def rclone(acc: Account, *args: str) -> str:
+    cmd = [RCLONE, *args, *BASE_FLAGS, *acc.rclone_args]
+    log.debug("run: %s", " ".join(cmd))
+    p = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if p.returncode != 0:
+        raise RcloneError(f"rclone {args[0]} failed: {p.stderr.strip()[-600:]}", p.returncode)
+    return p.stdout
+
+
+class Locked:
+    """One sync/pin/unpin at a time per account (daemon and Dolphin actions share it)."""
+    def __init__(self, acc: Account):
+        self.acc = acc
+
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.acc.lock_path, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# ───────────────────────────── data model ─────────────────────────────
+@dataclass
+class RItem:            # remote entry
+    path: str           # logical path (gdocs: "Plan.gdoc")
+    kind: str           # file | dir | gdoc
+    size: int
+    mtime: str
+    hash: str
+    id: str
+    rname: str          # path on the remote (gdocs: "Plan.desktop")
+    gtype: str = ""
+    owner: str = ""     # owner's email (from -M metadata; empty in Shared drives)
+
+
+@dataclass
+class LItem:            # local entry
+    path: str
+    kind: str           # real | stub | link
+    fpath: Path
+    size: int = 0
+    mtime: float = 0.0
+    xid: str = ""
+    orig: str = ""      # placeholders: the path they were created at (move detection)
+
+
+@dataclass
+class Row:              # last-synced state (the "base" of the 3-way merge)
+    path: str
+    kind: str           # file | dir | gdoc
+    state: str          # local | cloud | gdoc | dir
+    rid: str = ""
+    rsize: int = 0
+    rmtime: str = ""
+    rhash: str = ""
+    lsize: int = 0
+    lmtime: float = 0.0
+    rname: str = ""
+
+    def as_ritem(self) -> RItem:
+        return RItem(self.path, self.kind, self.rsize, self.rmtime, self.rhash, self.rid, self.rname)
+
+
+class RowMap(dict):
+    """path -> Row that remembers which paths changed, so the DB is updated incrementally."""
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.dirty: set[str] = set()
+
+    def __setitem__(self, k, v):
+        if dict.get(self, k) != v:
+            self.dirty.add(k)
+        super().__setitem__(k, v)
+
+    def __delitem__(self, k):
+        super().__delitem__(k)
+        self.dirty.add(k)
+
+    def pop(self, k, *default):
+        if k in self:
+            self.dirty.add(k)
+        return super().pop(k, *default)
+
+    def update(self, *args, **kw):
+        for k, v in dict(*args, **kw).items():
+            self[k] = v
+
+
+@dataclass
+class Scope:
+    """Part of the tree a sync reconciles: the direct children of `flat` folders and everything
+    below `deep` folders. A full sync is Scope(deep={""})."""
+    flat: set = field(default_factory=set)
+    deep: set = field(default_factory=set)
+    busy: frozenset = frozenset()               # entries left alone this time (see Engine.sync)
+
+    def contains(self, p: str) -> bool:         # is entry p (file or folder) reconciled?
+        return p != "" and p not in self.busy and \
+            (parent(p) in self.flat or any(p != d and under(p, d) for d in self.deep))
+
+    def is_deep(self, d: str) -> bool:          # is the whole subtree of folder d in scope?
+        return any(under(d, x) for x in self.deep)
+
+    def covers(self, d: str) -> bool:           # are all children of folder d in scope?
+        return d in self.flat or self.is_deep(d)
+
+
+class ScopeTooBig(Exception):
+    """A targeted sync would touch too many folders; a full sync is cheaper."""
+
+
+class DB:
+    SCHEMA = 1      # PRAGMA user_version.  0: files+pins (v0.1)  1: + meta
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.c = sqlite3.connect(path)
+        self.c.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, kind TEXT, state TEXT,"
+                       " rid TEXT, rsize INT, rmtime TEXT, rhash TEXT, lsize INT, lmtime REAL, rname TEXT)")
+        self.c.execute("CREATE TABLE IF NOT EXISTS pins(path TEXT PRIMARY KEY)")
+        self._migrate()
+        self._seen = self._data_version()
+
+    def _migrate(self):
+        v = self.c.execute("PRAGMA user_version").fetchone()[0]
+        if v < 1:       # small key/value store: Drive changes page token, ...
+            self.c.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+            self.c.execute("PRAGMA user_version = 1")
+        self.c.commit()
+
+    def _data_version(self) -> int:
+        return self.c.execute("PRAGMA data_version").fetchone()[0]
+
+    def changed(self) -> bool:
+        """True if another process (CLI pin/unpin/sync) committed since the last call."""
+        v = self._data_version()
+        changed, self._seen = v != self._seen, v
+        return changed
+
+    def load(self) -> RowMap:
+        return RowMap({r[0]: Row(*r) for r in self.c.execute(
+            "SELECT path,kind,state,rid,rsize,rmtime,rhash,lsize,lmtime,rname FROM files")})
+
+    def save(self, S: dict[str, Row]):
+        if not isinstance(S, RowMap):
+            return self.save_all(S)
+        if not S.dirty:
+            return
+        gone = [(k,) for k in S.dirty if k not in S]
+        rows = [astuple(S[k]) for k in S.dirty if k in S]
+        with self.c:
+            self.c.executemany("DELETE FROM files WHERE path=?", gone)
+            self.c.executemany("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+        S.dirty.clear()
+
+    def save_all(self, S: dict[str, Row]):
+        with self.c:
+            self.c.execute("DELETE FROM files")
+            self.c.executemany("INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?,?)",
+                               [astuple(r) for r in S.values()])
+        if isinstance(S, RowMap):
+            S.dirty.clear()
+
+    def pins(self) -> set[str]:
+        return {r[0] for r in self.c.execute("SELECT path FROM pins")}
+
+    def add_pin(self, p: str):
+        with self.c:
+            self.c.execute("INSERT OR IGNORE INTO pins VALUES (?)", (p,))
+
+    def remove_pins_under(self, p: str):
+        with self.c:
+            for q in self.pins():
+                if under(q, p):
+                    self.c.execute("DELETE FROM pins WHERE path=?", (q,))
+
+    def move_pins(self, old: str, new: str):
+        with self.c:
+            for q in self.pins():
+                if under(q, old):
+                    self.c.execute("UPDATE OR REPLACE pins SET path=? WHERE path=?", (new + q[len(old):], q))
+
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        r = self.c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def set_meta(self, key: str, value: str):
+        with self.c:
+            self.c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
+
+    def close(self):
+        self.c.close()
+
+
+def parse_ritem(e: dict) -> RItem | None:
+    rname = e["Path"]
+    rid = e.get("ID", "") or ""
+    mtime = e.get("ModTime", "")
+    md = e.get("Metadata") or {}
+    owner = md.get("owner", "") or ""
+    if e.get("IsDir"):
+        return RItem(rname, "dir", 0, mtime, "", rid, rname, owner=owner)
+    ct = md.get("content-type") or e.get("MimeType") or ""
+    h = (e.get("Hashes") or {}).get("md5", "") or ""
+    gtype = ""
+    if ct.startswith("application/vnd.google-apps."):
+        gtype = ct.rsplit(".", 1)[1]
+    elif rid and rname.endswith(".desktop") and not h:
+        gtype = "unknown"
+    if gtype:
+        base = rname[:-len(".desktop")] if rname.endswith(".desktop") else rname
+        return RItem(base + GTYPE_EXT.get(gtype, ".glink"), "gdoc", 0, mtime, "", rid, rname, gtype, owner)
+    return RItem(rname, "file", int(e.get("Size", 0) or 0), mtime, h, rid, rname, owner=owner)
+
+
+# ───────────────────────────── engine ─────────────────────────────
+class Engine:
+    MAX_SCOPE = 64      # folders listed by one targeted sync; beyond that a full sync is cheaper
+
+    def __init__(self, acc: Account, db: DB, S: dict[str, Row] | None = None):
+        self.acc, self.db = acc, db
+        self.S = S if S is not None else db.load()
+        self.pins = db.pins()
+        self.dupe_stubs: list[Path] = []
+        self.deferred: dict[str, float] = {}    # files skipped while still being written -> seconds left
+        self.cancelled = lambda: False          # set by the daemon: stop between steps on shutdown
+        self.on_event = lambda kind, path: None # set by the daemon: activity for gdrive-od-ui
+        try:                                    # path -> version Drive refused ([size, mtime] or ["dir"])
+            self.denied: dict[str, list] = json.loads(db.get_meta("denied") or "{}")
+        except ValueError:
+            self.denied = {}
+        self.restored: list[str] = []           # this run: deletions undone (not yours / not allowed)
+        self.refused: list[str] = []            # this run: local items Drive wouldn't take
+
+    # paths
+    def real_path(self, p: str) -> Path:
+        return self.acc.local / p
+
+    def stub_path(self, p: str) -> Path:
+        return self.acc.local / (p + STUB_EXT)
+
+    def pinned(self, p: str) -> bool:
+        return any(under(p, pin) for pin in self.pins)
+
+    # ── remote / local listings
+    def list_remote(self, sub: str = "", recursive: bool = True) -> dict[str, RItem]:
+        """Remote entries below folder `sub`: all levels, or only its direct children."""
+        flags = ["-R", "--fast-list"] if recursive else []
+        out = rclone(self.acc, "lsjson", *flags, *LIST_FLAGS, self.acc.rpath(sub))
+        items = {}
+        for e in json.loads(out or "[]"):
+            e["Path"] = join(sub, e["Path"])
+            r = parse_ritem(e)
+            if r and not ignored_name(os.path.basename(r.path)) and not r.path.endswith(STUB_EXT) \
+                    and not self.excluded(r.path):
+                items[r.path] = r
+        return items
+
+    def excluded(self, p: str) -> bool:
+        return any(under(p, x) for x in self.acc.exclude)
+
+    def stat_remote(self, rname: str) -> RItem:
+        e = json.loads(rclone(self.acc, "lsjson", "--stat", *LIST_FLAGS, self.acc.rpath(rname)))
+        e["Path"] = rname
+        return parse_ritem(e)
+
+    def scan_local(self, sub: str = "", recursive: bool = True):
+        """Local entries below folder `sub` -> (items, folders, folder exists)."""
+        root = self.acc.local
+        root.mkdir(parents=True, exist_ok=True)
+        items: dict[str, LItem] = {}
+        dirs: set[str] = set()
+        top = root / sub if sub else root
+        if sub and (top.is_symlink() or not top.is_dir()):
+            return items, dirs, False
+        for dirpath, dirnames, filenames in os.walk(top):
+            rel_dir = os.path.relpath(dirpath, root)
+            rel_dir = "" if rel_dir == "." else rel_dir
+            dirnames[:] = [d for d in dirnames if not ignored_name(d) and not self.excluded(join(rel_dir, d))
+                           and not os.path.islink(os.path.join(dirpath, d))]
+            for d in dirnames:
+                dirs.add(join(rel_dir, d))
+            if not recursive:
+                dirnames[:] = []
+            for fn in filenames:
+                if ignored_name(fn):
+                    continue
+                fp = Path(dirpath) / fn
+                try:
+                    st = fp.lstat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                rel = join(rel_dir, fn)
+                if self.excluded(rel):
+                    continue
+                if fn.endswith(STUB_EXT):
+                    logical = rel[:-len(STUB_EXT)]
+                    if logical in items and items[logical].kind == "real":
+                        self.dupe_stubs.append(fp)
+                        continue
+                    items[logical] = LItem(logical, "stub", fp, st.st_size, st.st_mtime, *self._stub_meta(fp))
+                elif Path(fn).suffix in LINK_EXTS and (lid := self._link_id(fp, st)) is not None:
+                    items[rel] = LItem(rel, "link", fp, st.st_size, st.st_mtime, lid)
+                else:
+                    if rel in items and items[rel].kind == "stub":
+                        self.dupe_stubs.append(items[rel].fpath)
+                    items[rel] = LItem(rel, "real", fp, st.st_size, st.st_mtime)
+        return items, dirs, True
+
+    def _scan_scope(self, scope: Scope):
+        L: dict[str, LItem] = {}
+        Ld: set[str] = set()
+        for d in scope.flat:
+            if not scope.is_deep(d):
+                items, dirs, _ = self.scan_local(d, recursive=False)
+                L.update(items)
+                Ld |= dirs
+        for d in scope.deep:
+            if not any(x != d and under(d, x) for x in scope.deep):
+                items, dirs, _ = self.scan_local(d, recursive=True)
+                L.update(items)
+                Ld |= dirs
+        return L, Ld
+
+    def _gather(self, dirs) -> tuple[Scope, dict, dict, set]:
+        """Listings for a targeted sync of the direct children of `dirs`. A folder missing on
+        either side widens the scope to its parent; a subfolder that is new, gone or one-sided
+        is taken with its whole subtree; the old folder of anything that moved here (same
+        Drive ID) is brought in too, so moves are recognised as moves."""
+        S = self.S
+        sc = Scope()
+        R: dict[str, RItem] = {}
+        L: dict[str, LItem] = {}
+        Ld: set[str] = set()
+        Sd = {p for p, r in S.items() if r.kind == "dir"}
+        skids: dict[str, set] = {}
+        by_rid: dict[str, list] = {}
+        for p, row in S.items():
+            if row.kind == "dir":
+                skids.setdefault(parent(p), set()).add(p)
+            if row.rid:
+                by_rid.setdefault(row.rid, []).append(p)
+
+        def grow():
+            if len(sc.flat) + len(sc.deep) >= self.MAX_SCOPE:
+                raise ScopeTooBig()
+
+        todo = set(dirs)
+        while todo:
+            d = min(todo, key=lambda x: (x.count("/"), x))      # shallow first: deep scopes cover the rest
+            todo.discard(d)
+            if sc.covers(d):
+                continue
+            grow()
+            sc.flat.add(d)
+            try:
+                got_r = self.list_remote(d, recursive=False)
+            except RcloneError as e:
+                if e.code != DIR_NOT_FOUND:
+                    raise
+                got_r = None
+            got_l, got_ld, l_ok = self.scan_local(d, recursive=False)
+            if got_r is None and not d:
+                raise RuntimeError(f"{self.acc.remote} was not found online — refusing to sync")
+            if d and (got_r is None or not l_ok):
+                todo.add(parent(d))
+            got_r = got_r or {}
+            R.update(got_r)
+            L.update(got_l)
+            Ld |= got_ld
+            found: list = [*got_r.values(), *got_l.values()]
+            for c in sorted({p for p, r in got_r.items() if r.kind == "dir"} | got_ld | skids.get(d, set())):
+                in_r = c in R and R[c].kind == "dir"
+                if sc.is_deep(c) or (in_r and c in Ld and c in Sd):
+                    continue
+                grow()
+                sc.deep.add(c)
+                if in_r:
+                    sub = self.list_remote(c, recursive=True)
+                    R.update(sub)
+                    found += sub.values()
+                if c in Ld:
+                    items, ldirs, _ = self.scan_local(c, recursive=True)
+                    L.update(items)
+                    Ld |= ldirs
+                    found += items.values()
+            for x in found:
+                xid = x.id if isinstance(x, RItem) else (x.xid if x.kind in ("stub", "link") else "")
+                for old in by_rid.get(xid, ()) if xid else ():
+                    if old != x.path and not sc.contains(old):
+                        todo.add(parent(old))
+        return sc, R, L, Ld
+
+    @staticmethod
+    def _stub_meta(fp: Path) -> tuple[str, str]:
+        xid, orig = getx(fp, "user.gdrive.id"), getx(fp, "user.gdrive.path")
+        if not (xid and orig):
+            try:
+                for line in fp.read_text(errors="ignore").splitlines():
+                    if line.startswith("id: ") and not xid:
+                        xid = line[4:].strip()
+                    elif line.startswith("path: ") and not orig:
+                        orig = line[6:].strip()
+            except OSError:
+                pass
+        return xid, orig
+
+    @staticmethod
+    def _link_id(fp: Path, st) -> str | None:
+        if st.st_size > 4096:
+            return None
+        try:
+            d = json.loads(fp.read_text())
+            return d.get("id", "") if d.get("gdrive_od") else None
+        except Exception:
+            return None
+
+    # ── change triage (no network): which folders does a targeted sync need?
+    def local_verdict(self, p: str, closed: bool = False) -> tuple[str, float]:
+        """Compare what is on disk at logical path p with the last-synced state.
+        ('same', 0): nothing to do (our own writes land here); ('settling', secs): a file still
+        being written; ('changed', 0): needs a sync. `closed`: inotify saw the writer close it."""
+        row = self.S.get(p)
+        fp, sp = self.real_path(p), self.stub_path(p)
+        st = lstat_or_none(fp)
+        if st and stat.S_ISDIR(st.st_mode):
+            return ("same" if row and row.kind == "dir" else "changed"), 0.0
+        if st and stat.S_ISREG(st.st_mode):
+            if fp.suffix in LINK_EXTS and (lid := self._link_id(fp, st)) is not None:
+                return ("same" if row and row.state == "gdoc" and lid == row.rid else "changed"), 0.0
+            if row and row.state == "local" and st.st_size == row.lsize and abs(st.st_mtime - row.lmtime) <= 1e-3:
+                return ("changed" if lstat_or_none(sp) else "same"), 0.0
+            age = time.time() - st.st_mtime
+            if not closed and 0 <= age < self.acc.settle:
+                return "settling", self.acc.settle - age
+            return "changed", 0.0
+        sst = lstat_or_none(sp)
+        if sst and stat.S_ISREG(sst.st_mode):
+            xid, orig = self._stub_meta(sp)
+            return ("same" if row and row.state == "cloud" and xid == row.rid and orig == p else "changed"), 0.0
+        return ("same" if row is None else "changed"), 0.0
+
+    def dirs_for_changes(self, changes: list[dict], root_id: str | None) -> set[str]:
+        """Folders touched by Drive Changes API entries: the old folder of every known item and
+        the new parent of every item still present. Unknown items in unknown folders are outside
+        this account's folder and ignored; changes that match the DB (our own uploads, moves,
+        metadata-only edits) are skipped. "Shared with me" has no root folder: an unknown item
+        someone else shared with you puts its top level on the list."""
+        S = self.S
+        paths_by_id: dict[str, list] = {}
+        dir_by_id: dict[str, str] = {}
+        for p, row in S.items():
+            if row.rid:
+                paths_by_id.setdefault(row.rid, []).append(p)
+                if row.kind == "dir":
+                    dir_by_id[row.rid] = p
+        if root_id:
+            dir_by_id[root_id] = ""
+        dirty: set[str] = set()
+        for ch in changes:
+            if ch.get("changeType", "file") != "file":
+                continue
+            f = ch.get("file") or {}
+            gone = bool(ch.get("removed") or f.get("trashed"))
+            old = paths_by_id.get(ch.get("fileId") or "", [])
+            if old and not gone and self._change_matches(f, old, root_id):
+                continue
+            dirty.update(parent(p) for p in old)
+            if gone:
+                continue
+            for par in f.get("parents") or [None]:
+                if par in dir_by_id:
+                    dirty.add(dir_by_id[par])
+                elif self.acc.section == "shared":
+                    if f.get("sharedWithMeTime") and not f.get("ownedByMe"):
+                        dirty.add("")       # newly shared with you (its parent isn't visible to you)
+                elif not root_id and par is not None:
+                    dirty.add("")           # can't tell whether it is our top level; look
+        return dirty
+
+    def _change_matches(self, f: dict, paths: list[str], root_id: str | None) -> bool:
+        for p in paths:
+            row, up = self.S[p], parent(p)
+            par_id = root_id if up == "" else (self.S[up].rid if up in self.S else "")
+            if not par_id or (f.get("parents") or []) != [par_id]:
+                return False
+            leaf, name = os.path.basename(row.rname or p), f.get("name", "")
+            if leaf != (name + ".desktop" if row.kind == "gdoc" else name):
+                return False
+            if row.kind == "file":
+                if f.get("md5Checksum"):
+                    if f["md5Checksum"] != row.rhash:
+                        return False
+                else:
+                    a, b = parse_time(f.get("modifiedTime", "")), parse_time(row.rmtime)
+                    if a is None or b is None or abs(a - b) > 1:
+                        return False
+                if "size" in f and int(f["size"]) != row.rsize:
+                    return False
+        return True
+
+    # ── primitive operations
+    def write_stub(self, p: str, r: RItem):
+        fp = self.stub_path(p)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(
+            f"This file is stored in Google Drive (account '{self.acc.name}') and is not on this computer.\n"
+            f"Double-click it, or right-click > Google Drive > Make available offline, to download it.\n"
+            f"size: {human(r.size)}\nid: {r.id}\npath: {p}\n")
+        if (t := parse_time(r.mtime)) is not None:
+            os.utime(fp, (t, t))
+        setx(fp, "user.gdrive.id", r.id)
+        setx(fp, "user.gdrive.path", p)
+        setx(fp, "user.xdg.comment", f"☁ Online only · {human(r.size)}")
+        set_status_tag(fp, TAG_ONLINE)
+        self.S[p] = Row(p, "file", "cloud", r.id, r.size, r.mtime, r.hash, 0, 0.0, r.rname)
+
+    def write_link(self, p: str, r: RItem):
+        fp = self.real_path(p)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        data = {"gdrive_od": 1, "account": self.acc.name, "id": r.id, "type": r.gtype,
+                "url": f"https://drive.google.com/open?id={r.id}"}
+        fp.write_text(json.dumps(data, indent=1) + "\n")
+        if (t := parse_time(r.mtime)) is not None:
+            os.utime(fp, (t, t))
+        setx(fp, "user.gdrive.id", r.id)
+        setx(fp, "user.xdg.comment", f"Google {r.gtype or 'file'} · opens in browser")
+        set_status_tag(fp, TAG_GOOGLE)
+        self.S[p] = Row(p, "gdoc", "gdoc", r.id, 0, r.mtime, "", 0, 0.0, r.rname)
+
+    def download(self, p: str, r: RItem):
+        final = self.real_path(p)
+        final.parent.mkdir(parents=True, exist_ok=True)
+        tmp = final.with_name("." + final.name + TMP_EXT)
+        try:
+            rclone(self.acc, "copyto", self.acc.rpath(r.rname), str(tmp))
+            os.replace(tmp, final)
+        finally:
+            tmp.unlink(missing_ok=True)
+        self.stub_path(p).unlink(missing_ok=True)
+        st = final.stat()
+        self.S[p] = Row(p, "file", "local", r.id, r.size, r.mtime, r.hash, st.st_size, st.st_mtime, r.rname)
+        set_status_tag(final, TAG_OFFLINE)
+        log.info("↓ %s", p)
+        self.on_event("download", p)
+
+    def upload(self, p: str):
+        fp = self.real_path(p)
+        st = fp.stat()
+        if self.refused_before(p, [st.st_size, st.st_mtime]):
+            return
+        if not self.placeable(p):
+            return self.refuse(p, [st.st_size, st.st_mtime], "not inside a folder that exists in Drive")
+        try:
+            rclone(self.acc, "copyto", str(fp), self.acc.rpath(p))
+        except RcloneError as e:
+            if not permission_denied(e):
+                raise
+            return self.refuse(p, [st.st_size, st.st_mtime], "no permission to upload")
+        r = self.stat_remote(p)
+        self.S[p] = Row(p, "file", "local", r.id, r.size, r.mtime, r.hash, st.st_size, st.st_mtime, p)
+        set_status_tag(fp, TAG_OFFLINE)
+        self.forget_refusal(p)
+        log.info("↑ %s", p)
+        self.on_event("upload", p)
+
+    def delete_remote(self, p: str, row: Row, r: RItem | None = None):
+        if r is not None and not self.owns(r):               # never delete someone else's file
+            return self.restore(p, row, r)
+        try:
+            rclone(self.acc, "deletefile", self.acc.rpath(row.rname or p))   # Drive: goes to trash
+        except RcloneError as e:
+            if not permission_denied(e):
+                raise
+            return self.restore(p, row, r or row.as_ritem())
+        self.S.pop(p, None)
+        log.info("✗ remote %s", p)
+        self.on_event("deleted in Drive", p)
+
+    # ── shared content: ownership and refused operations
+    def placeable(self, p: str) -> bool:
+        """"Shared with me" has no folder of its own: new items can only go inside a shared folder
+        that exists in Drive (else rclone would create it in My Drive)."""
+        if self.acc.section != "shared":
+            return True
+        top = self.S.get(p.split("/", 1)[0])
+        return "/" in p and top is not None and top.kind == "dir"
+
+    def owns(self, r: RItem) -> bool:
+        """In "Shared with me" only items you own may be deleted or moved from here."""
+        return self.acc.section != "shared" or not r.owner or not self.acc.email \
+            or r.owner.casefold() == self.acc.email.casefold()
+
+    def restore(self, p: str, row: Row, r: RItem):
+        """The deletion isn't allowed: the item comes back here as online-only."""
+        if row.kind == "gdoc":
+            self.write_link(p, r)
+        else:
+            self.write_stub(p, r)
+        self.restored.append(p)
+        log.info("↺ %s put back (owned by %s)", p, r.owner or "someone else")
+        self.on_event("put back", p)
+
+    def refused_before(self, p: str, version: list) -> bool:
+        return self.denied.get(p) == version
+
+    def refuse(self, p: str, version: list, why: str):
+        """Drive won't take this (version of a) local item: keep it here, don't retry until it changes."""
+        self.denied[p] = version
+        self.refused.append(p)
+        log.warning("%s: %s stays only on this computer (%s)", self.acc.title, p, why)
+        self.on_event("kept here only", p)
+
+    def forget_refusal(self, p: str):
+        self.denied.pop(p, None)
+
+    def _mkdir_remote(self, p: str, created: list):
+        if self.refused_before(p, ["dir"]):
+            return
+        if not self.placeable(p):
+            return self.refuse(p, ["dir"], "not inside a folder that exists in Drive")
+        try:
+            rclone(self.acc, "mkdir", self.acc.rpath(p))
+        except RcloneError as e:
+            if not permission_denied(e):
+                raise
+            return self.refuse(p, ["dir"], "no permission to create folders here")
+        self.S[p] = Row(p, "dir", "dir", rname=p)
+        created.append(p)
+
+    def delete_local(self, p: str, fp: Path):
+        trash_local(fp, self.acc)
+        self.S.pop(p, None)
+        log.info("✗ local %s", p)
+        self.on_event("deleted here", p)
+
+    def conflict(self, p: str, r: RItem):
+        stem, suf = os.path.splitext(p)
+        newp = f"{stem} (conflict {socket.gethostname()} {dt.datetime.now():%Y-%m-%d %H%M}){suf}"
+        os.rename(self.real_path(p), self.real_path(newp))
+        self.upload(newp)
+        self.download(p, r)
+        notify("Google Drive: sync conflict", f"Both copies of {os.path.basename(p)} changed.\n"
+                                              f"Your version was saved as {os.path.basename(newp)}")
+        log.warning("conflict on %s -> kept local as %s", p, newp)
+        self.on_event("conflict", newp)
+
+    def adopt_or_conflict(self, p: str, r: RItem, l: LItem):
+        if l.size == r.size and (not r.hash or md5_file(l.fpath) == r.hash):
+            self.S[p] = Row(p, "file", "local", r.id, r.size, r.mtime, r.hash, l.size, l.mtime, r.rname)
+            set_status_tag(l.fpath, TAG_OFFLINE)
+        else:
+            self.conflict(p, r)
+
+    def hydrate(self, p: str):
+        row = self.S.get(p)
+        if not row or row.state != "cloud":
+            return
+        self.download(p, row.as_ritem())
+
+    def dehydrate(self, p: str) -> bool:
+        row = self.S.get(p)
+        fp = self.real_path(p)
+        if not row or row.state != "local" or not fp.exists():
+            return False
+        st = fp.stat()
+        if st.st_size != row.lsize or abs(st.st_mtime - row.lmtime) > 1e-3:   # unsynced local edits
+            cur = self.stat_remote(row.rname)
+            if remote_changed(row, cur):
+                notify("Google Drive", f"{fp.name} changed both here and online; run a sync first.")
+                return False
+            self.upload(p)
+            row = self.S[p]
+        self.write_stub(p, row.as_ritem())
+        fp.unlink()
+        log.info("☁ %s", p)
+        return True
+
+    # ── the sync
+    def sync(self, force: bool = False, dirs: set[str] | None = None, fresh=frozenset(), busy=frozenset()):
+        """3-way merge of remote (R), last-synced (S) and local (L) state.
+        dirs=None: the whole tree. Otherwise a targeted sync of the direct children of `dirs`,
+        widened to whole subtrees where folders appeared, vanished or moved (see _gather).
+        fresh: files whose writer has closed them (inotify); they skip the `settle` wait.
+        busy: paths with local events still arriving (e.g. mid-"safe save", when the file is
+        briefly missing); nothing is done to them now, they get their own sync once quiet."""
+        acc, S = self.acc, self.S
+        self.dupe_stubs, self.deferred, self.restored, self.refused = [], {}, [], []
+        denied_before = dict(self.denied)
+        files_in_S = sum(1 for r in S.values() if r.kind != "dir")
+        if dirs is None:
+            scope = Scope(deep={""})
+            R = self.list_remote()
+            L, Ldirs, _ = self.scan_local()
+            if not R and files_in_S and not force:
+                raise RuntimeError("Remote listing is empty but files were synced before — refusing "
+                                   "(use 'gdrive-od sync --force' if you really emptied the Drive).")
+            if not L and not Ldirs and files_in_S and not force:
+                raise RuntimeError(f"The local folder {acc.local} is empty but files were synced before — "
+                                   f"refusing (use 'gdrive-od sync --force {acc.owner or acc.name}' if you "
+                                   "really want everything deleted in Drive too).")
+        else:
+            scope, R, L, Ldirs = self._gather(dirs)
+        inside = scope.contains
+        for fp in self.dupe_stubs:
+            fp.unlink(missing_ok=True)
+
+        scope.busy = frozenset(busy)
+        if busy:
+            R = {p: r for p, r in R.items() if p not in busy}
+            L, Ldirs = {p: l for p, l in L.items() if p not in busy}, Ldirs - busy
+
+        # 1. remote moves/renames (same Drive ID, new path) -> rename locally
+        if self._apply_remote_moves(R, scope):
+            L, Ldirs = self._scan_scope(scope)
+            if busy:
+                L, Ldirs = {p: l for p, l in L.items() if p not in busy}, Ldirs - busy
+        # 2. local moves/renames -> server-side move (no re-upload)
+        self._apply_local_moves(R, L, Ldirs, scope)
+        self.db.save(S)          # moves already happened on disk and online
+
+        now = time.time()
+
+        def settling(l: LItem) -> bool:
+            if l.kind != "real" or l.path in fresh:
+                return False
+            age = now - l.mtime
+            if 0 <= age < acc.settle:
+                self.deferred[l.path] = acc.settle - age
+                return True
+            return False
+
+        early, acts, late, created = [], [], [], []
+        n_del_remote = n_del_local = 0
+
+        # 3. directories
+        Rd = {p for p, r in R.items() if r.kind == "dir"}
+        Sd = {p for p, r in S.items() if r.kind == "dir" and inside(p)}
+        for p in sorted(Rd - Ldirs):
+            if p in Sd:      # synced before, deleted locally
+                late.append((p.count("/"), lambda p=p: self._rmdir_remote(p, R[p])))
+            else:
+                early.append(lambda p=p: (self.real_path(p).mkdir(parents=True, exist_ok=True),
+                                          S.__setitem__(p, Row(p, "dir", "dir", R[p].id, rname=p))))
+        for p in sorted(Ldirs - Rd):
+            if p in Sd:      # synced before, deleted remotely
+                late.append((p.count("/"), lambda p=p: self._rmdir_local(p)))
+            else:
+                early.append(lambda p=p: self._mkdir_remote(p, created))
+        for p in Rd & Ldirs:
+            S[p] = Row(p, "dir", "dir", R[p].id, rname=p)
+
+        # 4. files: 3-way merge of remote (R), last-synced (S), local (L)
+        keys = {p for p, r in R.items() if r.kind != "dir"} | \
+               {p for p, r in S.items() if r.kind != "dir" and inside(p)} | set(L)
+        for p in sorted(keys):
+            r = R.get(p) if (R.get(p) and R[p].kind != "dir") else None
+            s = S.get(p) if (S.get(p) and S[p].kind != "dir") else None
+            l = L.get(p)
+
+            # Google Docs/Sheets/... : always a small link file
+            if (r and r.kind == "gdoc") or (s and s.kind == "gdoc") or (l and l.kind == "link"):
+                if r and r.kind == "gdoc":
+                    if l and l.kind == "link":
+                        if not s or l.xid != r.id:
+                            acts.append(lambda p=p, r=r: self.write_link(p, r))
+                        else:
+                            S[p] = replace(s, rmtime=r.mtime, rname=r.rname)
+                    elif l is None and s:            # link deleted locally -> trash the doc
+                        n_del_remote += 1
+                        acts.append(lambda p=p, s=s, r=r: self.delete_remote(p, s, r))
+                    elif l is None:
+                        acts.append(lambda p=p, r=r: self.write_link(p, r))
+                else:                                 # gone remotely / orphan link
+                    if l and l.kind == "link":
+                        acts.append(lambda p=p, l=l: (l.fpath.unlink(missing_ok=True), S.pop(p, None)))
+                    elif s:
+                        S.pop(p, None)
+                continue
+
+            if r and s:
+                rc = remote_changed(s, r)
+                if s.state == "cloud":
+                    if l and l.kind == "stub":
+                        if self.pinned(p):
+                            acts.append(lambda p=p, r=r: self.download(p, r))
+                        elif rc or l.xid != r.id or l.orig != p:
+                            acts.append(lambda p=p, r=r: self.write_stub(p, r))
+                    elif l and l.kind == "real":
+                        if not settling(l):
+                            acts.append(lambda p=p, r=r, l=l: self.adopt_or_conflict(p, r, l))
+                    elif rc:                          # stub deleted but file changed online: keep it
+                        acts.append(lambda p=p, r=r: self.write_stub(p, r))
+                    else:                             # placeholder deleted -> trash online
+                        n_del_remote += 1
+                        acts.append(lambda p=p, s=s, r=r: self.delete_remote(p, s, r))
+                else:  # local
+                    if l and l.kind == "real":
+                        lc = local_changed(s, l)
+                        if lc and settling(l):
+                            continue
+                        if lc and rc:
+                            acts.append(lambda p=p, r=r, l=l: self.adopt_or_conflict(p, r, l))
+                        elif lc:
+                            acts.append(lambda p=p: self.upload(p))
+                        elif rc:
+                            acts.append(lambda p=p, r=r: self.download(p, r))
+                        else:
+                            set_status_tag(l.fpath, TAG_OFFLINE)
+                    elif l and l.kind == "stub":
+                        S[p] = replace(s, state="cloud", lsize=0, lmtime=0.0)
+                    elif rc:                          # deleted locally but changed online: restore
+                        acts.append(lambda p=p, r=r: self.download(p, r))
+                    else:
+                        n_del_remote += 1
+                        acts.append(lambda p=p, s=s, r=r: self.delete_remote(p, s, r))
+            elif r:                                   # new on the remote
+                if l is None:
+                    if self.pinned(p):
+                        acts.append(lambda p=p, r=r: self.download(p, r))
+                    else:
+                        acts.append(lambda p=p, r=r: self.write_stub(p, r))
+                elif l.kind == "real":
+                    if not settling(l):
+                        acts.append(lambda p=p, r=r, l=l: self.adopt_or_conflict(p, r, l))
+                else:
+                    acts.append(lambda p=p, r=r: self.write_stub(p, r))
+            elif s:                                   # deleted on the remote
+                if l and l.kind == "real":
+                    if s.state == "local" and not local_changed(s, l):
+                        n_del_local += 1
+                        acts.append(lambda p=p, l=l: self.delete_local(p, l.fpath))
+                    elif not settling(l):             # edited locally: keep and re-upload
+                        acts.append(lambda p=p: self.upload(p))
+                elif l:
+                    acts.append(lambda p=p, l=l: (l.fpath.unlink(missing_ok=True), S.pop(p, None)))
+                else:
+                    S.pop(p, None)
+            elif l:                                   # new local file
+                if l.kind == "real":
+                    if not settling(l):
+                        acts.append(lambda p=p: self.upload(p))
+                else:
+                    acts.append(lambda l=l: l.fpath.unlink(missing_ok=True))
+
+        cap = max(25, files_in_S * acc.max_delete_pct // 100)
+        if not force and (n_del_remote > cap or n_del_local > cap):
+            raise RuntimeError(f"Safety stop: this sync would delete {n_del_remote} files online and "
+                               f"{n_del_local} locally (limit {cap}). Check the folder, then run "
+                               f"'gdrive-od sync --force {acc.name}' if intended.")
+
+        errors = 0
+        steps = early + acts + [f for _, f in sorted(late, key=lambda x: -x[0])]
+        for i, fn in enumerate(steps):
+            if self.cancelled():
+                log.info("stopping: %d step(s) left for the next sync", len(steps) - i)
+                break
+            try:
+                fn()
+            except Exception as e:
+                errors += 1
+                log.error("%s", e)
+        if created:
+            self._fill_dir_ids(created)
+        self.db.save(S)
+        if self.denied != denied_before:
+            self.db.set_meta("denied", json.dumps(self.denied))
+        if errors:
+            notify("Google Drive", f"{acc.title}: {errors} item(s) failed to sync; see "
+                                   f"'journalctl --user -u gdrive-od@{acc.owner or acc.name}'")
+        if self.restored:
+            notify("Google Drive", f"{acc.title}: put back {len(self.restored)} item(s) you can't delete "
+                                   f"(e.g. {os.path.basename(self.restored[0])}): only the owner can.")
+        if self.refused:
+            notify("Google Drive", f"{acc.title}: {len(self.refused)} item(s) stay only on this computer "
+                                   f"(e.g. {os.path.basename(self.refused[0])}): no permission or no place in Drive.")
+        if dirs is None:
+            log.info("sync done for %s (%d errors)", acc.title, errors)
+        elif steps or errors:
+            log.info("targeted sync done for %s: %d step(s), %d errors", acc.title, len(steps), errors)
+
+    def _fill_dir_ids(self, created: list[str]):
+        """Folders we just created online: record their Drive IDs (needed to map Drive changes)."""
+        for up in sorted({parent(p) for p in created}):
+            try:
+                listing = self.list_remote(up, recursive=False)
+            except RuntimeError as e:
+                log.debug("cannot list %s: %s", up or "/", e)
+                continue
+            for p in created:
+                if parent(p) == up and p in self.S and p in listing and listing[p].id:
+                    self.S[p] = replace(self.S[p], rid=listing[p].id)
+
+    def _rmdir_local(self, p: str):
+        try:
+            self.real_path(p).rmdir()
+            self.S.pop(p, None)
+        except OSError:
+            pass  # still has unsynced local content; keep it
+
+    def _rmdir_remote(self, p: str, r: RItem | None = None):
+        if r is not None and not self.owns(r):
+            self.real_path(p).mkdir(parents=True, exist_ok=True)     # someone else's folder: put it back
+            return
+        try:
+            rclone(self.acc, "rmdir", self.acc.rpath(p))
+            self.S.pop(p, None)
+        except RcloneError as e:
+            if permission_denied(e):
+                self.real_path(p).mkdir(parents=True, exist_ok=True)
+            # otherwise not empty (new files online) -> recreated locally next cycle
+
+    def _move_pins(self, old: str, new: str):
+        if any(under(q, old) for q in self.pins):
+            self.db.move_pins(old, new)
+            self.pins = self.db.pins()
+
+    def _apply_remote_moves(self, R: dict[str, RItem], scope: Scope) -> bool:
+        S = self.S
+        byid = {r.id: r for r in R.values() if r.id}
+        moved = False
+        for p in sorted([p for p in S if scope.contains(p)], key=lambda k: k.count("/")):
+            row = S.get(p)
+            if row is None or p in R or not row.rid:
+                continue
+            r = byid.get(row.rid)
+            if not r or r.path in S or r.kind != row.kind or r.path in scope.busy:
+                continue
+            if row.kind == "dir":
+                old, new = self.real_path(p), self.real_path(r.path)
+            elif row.state == "cloud":
+                old, new = self.stub_path(p), self.stub_path(r.path)
+            else:
+                old, new = self.real_path(p), self.real_path(r.path)
+            if not old.exists() or new.exists():
+                continue
+            new.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(old, new)
+            moved = True
+            log.info("⇄ local rename %s -> %s", p, r.path)
+            self.on_event("moved", f"{p} → {r.path}")
+            if row.kind == "dir":
+                rekey(S, p, r.path)
+                self._move_pins(p, r.path)
+            else:
+                S.pop(p)
+                S[r.path] = replace(row, path=r.path, rname=r.rname)
+        return moved
+
+    def _apply_local_moves(self, R: dict[str, RItem], L: dict[str, LItem], Ldirs: set[str], scope: Scope):
+        S = self.S
+        self._apply_local_dir_moves(R, L, Ldirs, scope)
+        missing = {p: row for p, row in S.items()
+                   if row.kind != "dir" and scope.contains(p) and p not in L and p in R
+                   and not remote_changed(row, R[p])}
+        by_rid = {row.rid: p for p, row in missing.items() if row.rid}
+        sigs: dict = {}
+        for p, row in missing.items():
+            if row.state == "local":
+                sigs.setdefault((row.lsize, round(row.lmtime, 3)), []).append(p)
+        for l in [l for l in L.values() if l.path not in S]:
+            oldp = None
+            if l.kind in ("stub", "link") and l.xid:
+                oldp = by_rid.get(l.xid)
+            if not oldp and l.kind == "stub" and l.orig in missing:
+                oldp = l.orig
+            if not oldp and l.kind == "real":
+                c = sigs.get((l.size, round(l.mtime, 3)), [])
+                oldp = c[0] if len(c) == 1 else None
+            if not oldp or oldp not in missing:
+                continue
+            row = missing.pop(oldp)
+            if {"stub": "cloud", "link": "gdoc", "real": "local"}[l.kind] != row.state:
+                continue
+            if not self.owns(R[oldp]) or not self.placeable(l.path):   # undone by the merge below
+                continue
+            new_rname = l.path if row.kind == "file" else os.path.splitext(l.path)[0] + ".desktop"
+            try:
+                rclone(self.acc, "moveto", self.acc.rpath(row.rname), self.acc.rpath(new_rname))
+            except RuntimeError as e:
+                log.error("%s", e)
+                continue
+            log.info("⇄ remote move %s -> %s", oldp, l.path)
+            self.on_event("moved in Drive", f"{oldp} → {l.path}")
+            S.pop(oldp)
+            S[l.path] = replace(row, path=l.path, rname=new_rname)
+            r = R.pop(oldp)
+            R[l.path] = replace(r, path=l.path, rname=new_rname)
+            if l.kind == "stub":
+                l.fpath.unlink(missing_ok=True)
+                self.write_stub(l.path, R[l.path])
+                l.orig = l.path
+
+    def _apply_local_dir_moves(self, R: dict[str, RItem], L: dict[str, LItem], Ldirs: set[str], scope: Scope):
+        """A folder renamed/moved locally -> one server-side move, which keeps its Drive ID,
+        sharing and contents. Only when the match is unambiguous: same entry names, and at least
+        one placeholder/link with the same Drive ID or file with the same size and mtime."""
+        S = self.S
+        gone = [p for p, row in S.items()
+                if row.kind == "dir" and scope.contains(p) and scope.is_deep(p) and p not in Ldirs
+                and p in R and R[p].kind == "dir" and (not row.rid or R[p].id == row.rid)]
+        new = [d for d in Ldirs if d not in S and d not in R and scope.is_deep(d) and d not in scope.busy]
+        if not gone or not new:
+            return
+        skids: dict[str, set] = {}
+        for k in S:
+            skids.setdefault(parent(k), set()).add(k.rsplit("/", 1)[-1])
+        lkids: dict[str, set] = {}
+        for k in [*L, *Ldirs]:
+            lkids.setdefault(parent(k), set()).add(k.rsplit("/", 1)[-1])
+
+        def same_folder(m: str, d: str) -> bool:
+            names = skids.get(m, set())
+            if names != lkids.get(d, set()):
+                return False
+            strong = 0
+            for n in names:
+                row, l = S.get(join(m, n)), L.get(join(d, n))
+                if not row or not l or row.kind == "dir":
+                    continue
+                if l.kind in ("stub", "link"):
+                    if l.xid and row.rid and l.xid != row.rid:
+                        return False
+                    strong += bool(l.xid and l.xid == row.rid)
+                elif row.state == "local" and l.size == row.lsize and abs(l.mtime - row.lmtime) <= 1e-3:
+                    strong += 1
+            return strong > 0 or not names
+
+        matches = {}
+        for m in gone:
+            cands = [d for d in new if same_folder(m, d)]
+            if len(cands) == 1:
+                matches[m] = cands[0]
+        claimed = Counter(matches.values())
+        for m in sorted(matches, key=lambda k: k.count("/")):
+            d = matches[m]
+            if claimed[d] > 1 or m not in S or d in S or not self.owns(R[m]) or not self.placeable(d):
+                continue
+            try:
+                rclone(self.acc, "moveto", self.acc.rpath(S[m].rname or m), self.acc.rpath(d))
+            except RuntimeError as e:
+                log.error("%s", e)
+                continue
+            log.info("⇄ remote move %s/ -> %s/", m, d)
+            self.on_event("moved in Drive", f"{m}/ → {d}/")
+            rekey(S, m, d)
+            rekey(R, m, d)
+            self._move_pins(m, d)
+
+
+def remote_changed(s: Row, r: RItem) -> bool:
+    if s.rhash and r.hash:
+        return s.rhash != r.hash
+    return s.rsize != r.size or s.rmtime != r.mtime
+
+
+def local_changed(s: Row, l: LItem) -> bool:
+    return s.lsize != l.size or abs(s.lmtime - l.mtime) > 1e-3
+
+
+# ───────────────────────────── Drive Changes API ─────────────────────────────
+class AuthError(RuntimeError):
+    pass
+
+
+def sign_in_expired(e: Exception) -> bool:
+    """Google rejected the refresh token (revoked, password change, or the 7-day limit of an
+    OAuth app in 'Testing' status): only signing in again helps."""
+    s = str(e)
+    return any(k in s for k in ("invalid_grant", "expired or revoked", "rclone config reconnect"))
+
+
+def permission_denied(e: Exception) -> bool:
+    """Drive refused because of your role on the item (viewer, not the owner...), not a rate limit."""
+    s = str(e)
+    return any(k in s for k in ("insufficientFilePermissions", "insufficientPermissions",
+                                "sufficient permissions", "cannotAddChildren"))
+
+
+def notify_reconnect(acc: Account):
+    notify("Google Drive — sign-in expired",
+           f"'{acc.name}' ({acc.email or acc.remote}) must sign in to Google again: right-click in its "
+           f"folder > Google Drive > Reconnect account, or run 'gdrive-od reconnect {acc.name}'.")
+
+
+class ApiError(RuntimeError):
+    def __init__(self, code: int, msg: str):
+        super().__init__(f"Drive API error {code}: {msg}")
+        self.code = code
+
+
+class TooManyChanges(Exception):
+    pass
+
+
+def split_remote(remote: str) -> tuple[str, str]:
+    """'gdrive:Docs/Work' -> ('gdrive', 'Docs/Work'). Local paths -> ('', path)."""
+    if ":" not in remote or remote.startswith(("/", ".", "~")):
+        return "", remote
+    name, path = remote.split(":", 1)
+    if not name or "/" in name:
+        return "", remote
+    return name, path
+
+
+class DriveChanges:
+    """Drive -> local change feed: Drive API v3 changes.list, authenticated with rclone's OAuth
+    token. The token is read from `rclone config dump`. When it expires it is refreshed with the
+    remote's own client_id/secret if it has them, otherwise rclone refreshes it (and saves it)
+    the next time it talks to Drive, which `rclone about` makes happen."""
+    API = "https://www.googleapis.com/drive/v3"
+    TOKEN_URL = "https://oauth2.googleapis.com/token"
+    FIELDS = ("nextPageToken,newStartPageToken,changes(changeType,removed,fileId,"
+              "file(name,mimeType,parents,trashed,md5Checksum,size,modifiedTime,ownedByMe,sharedWithMeTime))")
+    MAX_CHANGES = 5000          # beyond this a full sync is cheaper
+
+    def __init__(self, acc: Account, name: str, params: dict):
+        self.acc, self.name, self.params = acc, name, params     # name: "gdrive" or "gdrive,opt=x"
+        self.drive_id = params.get("team_drive") or ""
+        self.api_base = os.environ.get("GDOD_DRIVE_API") or self.API
+        self.token_url = os.environ.get("GDOD_TOKEN_URL") or params.get("token_url") or self.TOKEN_URL
+        self._token, self._expiry = "", 0.0
+
+    @classmethod
+    def for_account(cls, acc: Account) -> DriveChanges | None:
+        name, _ = split_remote(acc.remote)
+        if not name:
+            log.info("%s: Drive change feed off (%s is not an rclone remote)", acc.name, acc.remote)
+            return None
+        try:
+            dump = json.loads(rclone(acc, "config", "dump"))
+        except (RuntimeError, ValueError) as e:
+            log.warning("%s: Drive change feed off, cannot read the rclone config: %s", acc.name, e)
+            return None
+        base, *opts = name.split(",")
+        params = dict(dump.get(base) or {})
+        for o in opts:
+            k, _, v = o.partition("=")
+            params[k.strip()] = v.strip().strip("'\"")
+        if params.get("type") != "drive":
+            log.info("%s: Drive change feed off (remote %s is not Google Drive)", acc.name, base)
+            return None
+        if not params.get("token"):
+            log.info("%s: Drive change feed off (remote %s has no OAuth token; service accounts are "
+                     "not supported)", acc.name, base)
+            return None
+        return cls(acc, name, params)
+
+    # ── auth
+    def _config_token(self) -> dict:
+        dump = json.loads(rclone(self.acc, "config", "dump"))
+        try:
+            return json.loads((dump.get(self.name.split(",")[0]) or {}).get("token") or "{}")
+        except ValueError:
+            return {}
+
+    def _use(self, tok: dict, min_left: float, stale: str) -> bool:
+        exp = parse_time(tok.get("expiry") or "") or 0.0
+        if tok.get("access_token") and tok["access_token"] != stale and exp - time.time() > min_left:
+            self._token, self._expiry = tok["access_token"], exp
+            return True
+        return False
+
+    def access_token(self, force: bool = False) -> str:
+        """A valid access token. force=True: the current one was rejected, get another."""
+        if not force and self._token and self._expiry - time.time() > 15:
+            return self._token
+        stale = self._token if force else ""
+        tok = self._config_token()                  # another rclone run may have refreshed it
+        if self._use(tok, 15, stale):
+            return self._token
+        cid, secret = self.params.get("client_id"), self.params.get("client_secret")
+        if cid and secret and tok.get("refresh_token"):
+            body = urllib.parse.urlencode({"client_id": cid, "client_secret": secret, "grant_type": "refresh_token",
+                                           "refresh_token": tok["refresh_token"]}).encode()
+            try:
+                d = self._http(urllib.request.Request(self.token_url, data=body))
+            except ApiError as e:
+                raise AuthError(f"token refresh failed: {e}") from None
+            self._token, self._expiry = d["access_token"], time.time() + int(d.get("expires_in", 3600))
+            return self._token
+        try:            # rclone's own client: any authenticated rclone call refreshes and saves the token
+            rclone(self.acc, "about", self.name + ":")
+        except RuntimeError as e:
+            raise AuthError(f"rclone could not refresh its token: {e}") from None
+        if self._use(self._config_token(), 5, stale):
+            return self._token
+        raise AuthError(f"no usable access token for rclone remote {self.name}: "
+                        f"run 'rclone config reconnect {self.name}:'")
+
+    # ── HTTP
+    @staticmethod
+    def _http(req: urllib.request.Request, timeout: float = 30) -> dict:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, e.read()[:300].decode(errors="replace").strip()) from None
+
+    def api(self, path: str, **params) -> dict:
+        url = f"{self.api_base}/{path}?{urllib.parse.urlencode(params)}"
+        for force in (False, True):
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + self.access_token(force)})
+            try:
+                return self._http(req)
+            except ApiError as e:
+                if e.code != 401 or force:
+                    raise
+        raise AssertionError("unreachable")
+
+    # ── the feed
+    def _drive_params(self) -> dict:
+        p = {"supportsAllDrives": "true"}
+        if self.drive_id:                       # a Shared Drive remote (team_drive = ...)
+            p["driveId"] = self.drive_id
+        return p
+
+    def start_token(self) -> str:
+        return self.api("changes/startPageToken", **self._drive_params())["startPageToken"]
+
+    def list_changes(self, token: str) -> tuple[list[dict], str]:
+        """Every change since `token`, and the token to continue from. My Drive remotes don't
+        ask for Shared Drive items (busy organisation drives would only add noise)."""
+        extra = {"includeItemsFromAllDrives": "true"} if self.drive_id else {}
+        out: list[dict] = []
+        while True:
+            d = self.api("changes", pageToken=token, pageSize=1000, fields=self.FIELDS,
+                         **self._drive_params(), **extra)
+            out += d.get("changes", [])
+            if d.get("newStartPageToken"):
+                return out, d["newStartPageToken"]
+            if len(out) > self.MAX_CHANGES:
+                raise TooManyChanges()
+            token = d.get("nextPageToken")
+            if not token:
+                raise ApiError(0, "changes.list returned no page token")
+
+    def root_id(self) -> str:
+        """Drive ID of the folder this account syncs (parent ID of its top-level items); None for
+        "Shared with me", which has no folder of its own."""
+        if str(self.params.get("shared_with_me", "")).lower() in ("true", "1"):
+            return None
+        _, sub = split_remote(self.acc.remote)
+        sub = sub.strip("/")
+        if sub:
+            up, _, leaf = sub.rpartition("/")
+            for e in json.loads(rclone(self.acc, "lsjson", "--dirs-only", f"{self.name}:{up}") or "[]"):
+                if e.get("Name") == leaf and e.get("ID"):
+                    return e["ID"]
+            raise RuntimeError(f"folder {sub} not found on {self.name}:")
+        if self.params.get("root_folder_id"):
+            return self.params["root_folder_id"]
+        if self.drive_id:
+            return self.drive_id
+        return self.api("files/root", fields="id")["id"]
+
+
+# ───────────────────────────── inotify ─────────────────────────────
+IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_FROM, IN_MOVED_TO = 0x2, 0x8, 0x40, 0x80
+IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_MOVE_SELF = 0x100, 0x200, 0x400, 0x800
+IN_UNMOUNT, IN_Q_OVERFLOW, IN_IGNORED = 0x2000, 0x4000, 0x8000
+IN_ONLYDIR, IN_DONT_FOLLOW, IN_EXCL_UNLINK, IN_ISDIR = 0x1000000, 0x2000000, 0x4000000, 0x40000000
+INOTIFY_EVENT = struct.Struct("iIII")       # wd, mask, cookie, len; then the name
+
+
+class Watcher:
+    """Recursive inotify watch on a folder (libc through ctypes). A thread drains the kernel queue
+    into `pending` (path -> [monotonic time of last event, writer closed it]) so the queue can't
+    overflow during long syncs. New folders get watches as they appear; xattr changes (Dolphin
+    tags, our status tags) are not watched at all."""
+    MASK = (IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE |
+            IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK)
+    _libc = None
+
+    def __init__(self, root: Path, wake: threading.Event | None = None):
+        if Watcher._libc is None:
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+            libc.inotify_init1.argtypes = [ctypes.c_int]
+            libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+            Watcher._libc = libc
+        self.fd = self._libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, f"inotify_init1: {os.strerror(err)}")
+        self.root, self.wake = root, wake or threading.Event()
+        self.lock = threading.Lock()
+        self.wd2dir: dict[int, str] = {}
+        self.pending: dict[str, list] = {}
+        self.overflow = False
+        self.alive = True           # False once the root itself is gone
+        self.complete = True        # False when the inotify watch limit was hit
+        self._moves: dict[int, str] = {}        # cookie -> folder moved away (pairs with MOVED_TO)
+        self._pipe = os.pipe()
+        self._add_tree("", report=False)
+        if "" not in self.wd2dir.values():
+            os.close(self.fd)
+            raise OSError(errno.ENOENT, f"cannot watch {root}")
+        self.thread = threading.Thread(target=self._run, name="inotify", daemon=True)
+        self.thread.start()
+
+    def healthy(self) -> bool:
+        return self.alive and self.complete
+
+    def take(self, min_age: float) -> dict[str, bool]:
+        """Paths whose last event is at least min_age seconds old -> writer closed the file."""
+        return {p: v[0] for p, v in self.take_entries(min_age).items()}
+
+    def take_entries(self, min_age: float) -> dict[str, tuple[bool, bool]]:
+        """Like take(), with (writer closed it, was a folder) per path."""
+        now = time.monotonic()
+        with self.lock:
+            ready = {p: (v[1], v[2]) for p, v in self.pending.items() if now - v[0] >= min_age}
+            for p in ready:
+                del self.pending[p]
+        return ready
+
+    def next_ready(self, min_age: float) -> float | None:
+        with self.lock:
+            return min((v[0] for v in self.pending.values()), default=-1.0) + min_age if self.pending else None
+
+    def take_overflow(self) -> bool:
+        with self.lock:
+            o, self.overflow = self.overflow, False
+            return o
+
+    def close(self):
+        try:
+            os.write(self._pipe[1], b"x")
+            self.thread.join(5)
+        finally:
+            for fd in (self.fd, *self._pipe):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _add_tree(self, rel: str, report: bool = True):
+        """Watch folder `rel` and everything below it. report: also mark what is already inside
+        as changed (it may have appeared before the watch existed)."""
+        now = time.monotonic()
+        for dirpath, dirnames, filenames in os.walk(self.root / rel if rel else self.root):
+            r = os.path.relpath(dirpath, self.root)
+            r = "" if r == "." else r
+            wd = self._libc.inotify_add_watch(self.fd, os.fsencode(dirpath), self.MASK)
+            if wd < 0:
+                if ctypes.get_errno() == errno.ENOSPC and self.complete:
+                    self.complete = False
+                    log.warning("inotify watch limit reached (fs.inotify.max_user_watches): some folders "
+                                "are only synced by the periodic full sync")
+                dirnames[:] = []
+                continue
+            self.wd2dir[wd] = r
+            dirnames[:] = [d for d in dirnames
+                           if not ignored_name(d) and not os.path.islink(os.path.join(dirpath, d))]
+            if report:
+                for n in filenames:
+                    if not ignored_name(n):
+                        self.pending[join(r, n)] = [now, False, False]
+                for n in dirnames:
+                    self.pending[join(r, n)] = [now, False, True]
+
+    def _unwatch(self, rel: str):
+        for wd, d in list(self.wd2dir.items()):
+            if under(d, rel):
+                self._libc.inotify_rm_watch(self.fd, wd)
+                del self.wd2dir[wd]
+
+    def _run(self):
+        try:
+            while True:
+                r, _, _ = select.select([self.fd, self._pipe[0]], [], [])
+                if self._pipe[0] in r:
+                    return
+                try:
+                    data = os.read(self.fd, 1 << 16)
+                except BlockingIOError:
+                    continue
+                with self.lock:
+                    news = self._parse(data)
+                    for rel in self._moves.values():        # moved out of the tree: stop watching
+                        self._unwatch(rel)
+                    self._moves.clear()
+                if news:
+                    self.wake.set()
+        except Exception as e:
+            log.error("inotify watcher stopped: %s", e)
+            with self.lock:
+                self.alive, self.overflow = False, True
+            self.wake.set()
+
+    def _parse(self, data: bytes) -> bool:
+        """Apply a buffer of events. True if the daemon should look (new path, overflow...);
+        more events for an already-pending path only push its timestamp back."""
+        now = time.monotonic()
+        news = False
+        off = 0
+        while off + INOTIFY_EVENT.size <= len(data):
+            wd, mask, cookie, n = INOTIFY_EVENT.unpack_from(data, off)
+            name = os.fsdecode(data[off + INOTIFY_EVENT.size:off + INOTIFY_EVENT.size + n].split(b"\0", 1)[0])
+            off += INOTIFY_EVENT.size + n
+            if mask & IN_Q_OVERFLOW:
+                self.overflow = news = True
+                continue
+            d = self.wd2dir.get(wd)
+            if mask & IN_IGNORED:
+                self.wd2dir.pop(wd, None)
+                if d == "":
+                    self.alive, self.overflow, news = False, True, True
+                continue
+            if d is None:
+                continue
+            if not name:            # about the watched folder itself; its parent reports it
+                if d == "" and mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT):
+                    self.alive, self.overflow, news = False, True, True
+                continue
+            if ignored_name(name):
+                continue
+            rel = join(d, name)
+            if mask & IN_ISDIR:
+                if mask & IN_MOVED_FROM:
+                    self._moves[cookie] = rel
+                elif mask & IN_MOVED_TO and self._moves.pop(cookie, None) is not None:
+                    self._add_tree(rel, report=False)       # renamed inside the tree: re-map watches
+                elif mask & (IN_CREATE | IN_MOVED_TO):
+                    self._add_tree(rel)
+                    news = True
+            news = news or rel not in self.pending
+            was_dir = bool(mask & IN_ISDIR) or (rel in self.pending and self.pending[rel][2])
+            self.pending[rel] = [now, not mask & (IN_CREATE | IN_MODIFY), was_dir]
+        return news
+
+
+# ───────────────────────────── status (for gdrive-od-ui) ─────────────────────────────
+def status_path(name: str) -> Path:
+    return STATE_DIR / f"{name}.status.json"
+
+
+def backup_pause_flag(name: str) -> Path:
+    return STATE_DIR / f"{name}.backup-paused"
+
+
+class StatusBoard:
+    """What an account's daemon is doing, published as STATE_DIR/<account>.status.json (written
+    atomically, at most every 2 s, only after a change) for gdrive-od-ui: per sync root its state,
+    last syncs, counts and change-feed health; backup progress; recent activity."""
+    KEEP = 300
+
+    def __init__(self, acc: Account):
+        self.path = status_path(acc.name)
+        self.lock = threading.Lock()
+        self.changed = threading.Event()
+        self.data: dict = {"account": acc.name, "email": acc.email, "local": str(acc.local), "pid": os.getpid(),
+                           "started": time.time(), "attention": "", "roots": {}, "backup": None, "activity": []}
+
+    def root(self, name: str, **fields):
+        with self.lock:
+            self.data["roots"].setdefault(name, {}).update(fields)
+        self.changed.set()
+
+    def backup(self, **fields):
+        with self.lock:
+            self.data["backup"] = {**(self.data["backup"] or {}), **fields}
+        self.changed.set()
+
+    def account(self, **fields):
+        with self.lock:
+            self.data.update(fields)
+        self.changed.set()
+
+    def event(self, where: str, kind: str, path: str):
+        with self.lock:
+            act = self.data["activity"]
+            act.append({"t": time.time(), "where": where, "kind": kind, "path": path})
+            del act[:-self.KEEP]
+        self.changed.set()
+
+    def run(self, stop: threading.Event):
+        self.write()
+        while not stop.is_set():
+            if self.changed.wait(2):
+                stop.wait(1)                    # coalesce bursts (e.g. thousands of placeholders)
+                self.write()
+
+    def write(self, **final):
+        with self.lock:
+            self.changed.clear()
+            text = json.dumps({**self.data, **final, "updated": time.time()})
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            tmp.write_text(text)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log.debug("cannot write %s: %s", self.path, e)
+
+
+class _NoBoard:
+    """Stand-in when nobody listens (tests, CLI)."""
+    def __getattr__(self, _):
+        return lambda *a, **k: None
+
+
+NO_BOARD = _NoBoard()
+
+
+def file_counts(S: dict) -> dict:
+    c = {"local": 0, "cloud": 0, "gdoc": 0, "dir": 0}
+    for r in S.values():
+        c[r.state] = c.get(r.state, 0) + 1
+    return c
+
+
+# ───────────────────────────── daemon ─────────────────────────────
+SYNC_SLOTS = threading.BoundedSemaphore(3)      # syncs at once per process (many sections start together)
+
+
+class Daemon:
+    """Live sync for one account. Local changes arrive through inotify, Drive changes through the
+    Changes API. Both become targeted syncs of the affected folders. A full sync runs at start,
+    every full_sync_interval (every `interval` when live detection is unavailable), on SIGUSR1,
+    and after an inotify queue overflow."""
+    QUIET = 2.0             # seconds without new events before a local change is synced
+
+    def __init__(self, acc: Account, changes="auto", board=NO_BOARD):
+        self.acc = acc
+        self.board = board                      # StatusBoard of the account's process (gdrive-od-ui)
+        self.db: DB | None = None               # opened by run(): sqlite objects stay in one thread
+        self.eng: Engine | None = None
+        self.changes = changes              # DriveChanges | None | "auto"
+        self.wake = threading.Event()
+        self._stop = threading.Event()
+        self.full_requested = True
+        self.watcher: Watcher | None = None
+        self.deferred: dict[str, float] = {}    # path -> monotonic time to look at it again
+        self.token: str | None = None           # Drive changes page token (also kept in the DB)
+        self.pending: list[dict] = []           # fetched Drive changes not yet applied
+        self.pending_token: str | None = None
+        self.root: str | None = None
+        self.root_tried = False
+        self.feed_fails = 0
+        self.feed_retry = 0.0
+        self.fails = 0
+        self.retry_at = 0.0
+
+    def request_full(self):
+        self.full_requested = True
+        self.wake.set()
+
+    def stop(self):
+        self._stop.set()
+        self.wake.set()
+
+    # ── main loop
+    def run(self):
+        acc = self.acc
+        self.db = DB(acc.db_path)
+        self._start_watcher()
+        if self.changes == "auto":
+            self.changes = DriveChanges.for_account(acc)
+        log.info("daemon started for %s: local changes %s, Drive changes %s", acc.title,
+                 "live (inotify)" if self.watcher else f"every {acc.interval}s",
+                 f"every {acc.poll_interval:g}s (Changes API)" if self.changes else f"every {acc.interval}s")
+        self.board.root(acc.name, title=acc.title, section=acc.section or "my-drive", local=str(acc.local),
+                        state="starting", feed="live" if self.changes else "off",
+                        watch="live" if self.watcher else "off")
+        next_full = next_poll = 0.0
+        try:
+            while not self._stop.is_set():
+                self.wake.clear()
+                now = time.monotonic()
+                if self.watcher and self.watcher.take_overflow():
+                    log.warning("inotify: event queue overflow or watch lost; running a full sync")
+                    self.full_requested = True
+                if self.full_requested or now >= next_full:
+                    self.full_requested = False
+                    ok = self._full_sync()
+                    next_full = time.monotonic() + (self._full_period() if ok else acc.interval)
+                    next_poll = 0.0
+                    self.board.root(acc.name, next_full=time.time() + next_full - time.monotonic())
+                else:
+                    if self.changes and now >= max(next_poll, self.feed_retry):
+                        self._poll()
+                        next_poll = time.monotonic() + acc.poll_interval
+                    if now >= self.retry_at and not self.full_requested:
+                        self._targeted()
+                self.wake.wait(self._timeout(next_full, next_poll))
+        finally:
+            if self.watcher:
+                self.watcher.close()
+            self.db.close()
+
+    def _timeout(self, next_full: float, next_poll: float) -> float:
+        now = time.monotonic()
+        if self.full_requested:
+            return 0
+        t = next_full
+        if self.changes:
+            t = min(t, max(next_poll, self.feed_retry))
+        work = [w for w in (self.watcher.next_ready(self.QUIET) if self.watcher else None,
+                            min(self.deferred.values(), default=None),
+                            now if self.pending else None) if w is not None]
+        if work:
+            t = min(t, max(min(work), self.retry_at))
+        return min(max(t - now, 0.05), 3600)
+
+    def _full_period(self) -> float:
+        live = self.watcher is not None and self.watcher.healthy() and self.changes and self.feed_fails < 3
+        return self.acc.full_sync_interval if live else self.acc.interval
+
+    def _start_watcher(self):
+        if self.watcher:
+            self.watcher.close()
+            self.watcher = None
+        try:
+            self.acc.local.mkdir(parents=True, exist_ok=True)
+            self.watcher = Watcher(self.acc.local, self.wake)
+            log.info("watching %d folders under %s", len(self.watcher.wd2dir), self.acc.local)
+        except OSError as e:
+            log.warning("inotify unavailable (%s); local changes are synced every %ss", e, self.acc.interval)
+
+    def _engine(self) -> Engine:
+        if self.db.changed() or self.eng is None:   # a CLI pin/unpin/sync changed the DB
+            self.eng = Engine(self.acc, self.db)
+            self.eng.cancelled = self._stop.is_set
+            self.eng.on_event = lambda kind, path: self.board.event(self.acc.title, kind, path)
+        return self.eng
+
+    def _synced(self, eng: Engine, full: bool):
+        now = time.time()
+        self.board.account(attention="")
+        self.board.root(self.acc.name, state="idle", error="", last_sync=now, counts=file_counts(eng.S),
+                        watch="live" if self.watcher and self.watcher.healthy() else "limited" if self.watcher else "off",
+                        **({"last_full": now} if full else {}))
+
+    def _defer(self, d: dict[str, float]):
+        for p, left in d.items():
+            self.deferred[p] = time.monotonic() + left + 0.2
+
+    def _local_events(self) -> tuple[dict[str, bool], set[str]]:
+        """(quiet paths -> writer closed them, logical paths whose events are still arriving)."""
+        if not self.watcher:
+            return {}, set()
+        ready = self.watcher.take(self.QUIET)
+        with self.watcher.lock:
+            busy = {p[:-len(STUB_EXT)] if p.endswith(STUB_EXT) else p for p in self.watcher.pending}
+        return ready, busy
+
+    def _set_token(self, token: str):
+        self.token = token
+        self.db.set_meta("changes_token", token)
+        self.db.set_meta("changes_remote", self.acc.remote)
+
+    def _root(self) -> str | None:
+        if not self.root_tried and self.changes:
+            self.root_tried = True
+            try:
+                self.root = self.changes.root_id()
+                self.db.set_meta("root_id", self.root)
+            except Exception as e:
+                log.warning("cannot look up the Drive ID of %s (%s); top-level changes are found by listing",
+                            self.acc.remote, e)
+        return self.root
+
+    # ── work
+    def _full_sync(self) -> bool:
+        fresh_token = None
+        if self.changes:
+            try:
+                fresh_token = self.changes.start_token()    # before listing: nothing slips through
+                self.feed_fails, self.feed_retry = 0, 0.0    # e.g. right after a reconnect
+            except Exception as e:
+                self._feed_failed(e)
+        if self.watcher is None or not self.watcher.alive:
+            self._start_watcher()
+        try:
+            with SYNC_SLOTS, Locked(self.acc):
+                self.board.root(self.acc.name, state="syncing", phase="full")
+                eng = self._engine()
+                events, busy = self._local_events()     # this sync covers the quiet ones
+                eng.sync(fresh={p for p, closed in events.items() if closed}, busy=busy)
+                self.deferred = {}
+                self._defer(eng.deferred)
+                self._synced(eng, full=True)
+        except Exception as e:
+            self._sync_failed(e)
+            return False
+        if fresh_token:
+            self._set_token(fresh_token)
+            self.pending, self.pending_token = [], None
+        if self.root is None:
+            self.root_tried = False
+        self.fails, self.retry_at = 0, 0.0
+        return True
+
+    def _poll(self):
+        try:
+            if self.token is None:          # feed (re)starting: get a token, then reconcile fully
+                self._set_token(self.changes.start_token())
+                self.full_requested = True
+                self.feed_fails = 0
+                return
+            changes, new_token = self.changes.list_changes(self.pending_token or self.token)
+        except TooManyChanges:
+            log.info("many Drive changes at once; running a full sync")
+            self.full_requested = True
+            return
+        except ApiError as e:
+            if e.code in (400, 404, 410):      # page token rejected: start over
+                log.warning("Drive changes: %s; resetting", e)
+                self.token, self.pending, self.pending_token = None, [], None
+            self._feed_failed(e)
+            return
+        except Exception as e:
+            self._feed_failed(e)
+            return
+        if self.feed_fails:
+            self.board.root(self.acc.name, feed="live", feed_error="")
+        self.feed_fails = 0
+        self.pending += changes
+        self.pending_token = new_token
+        if not self.pending:
+            if new_token != self.token:
+                self._set_token(new_token)
+            self.pending_token = None
+        elif len(self.pending) > DriveChanges.MAX_CHANGES:      # backlog while syncs kept failing
+            log.info("many Drive changes waiting; running a full sync")
+            self.full_requested = True
+
+    def _feed_failed(self, e: Exception):
+        self.feed_fails += 1
+        if isinstance(e, AuthError) or sign_in_expired(e):
+            delay = 1800
+            if sign_in_expired(e):
+                notify_reconnect(self.acc)
+            else:
+                notify("Google Drive", f"{self.acc.title}: cannot read Drive changes ({e}); "
+                                       f"falling back to a full sync every {self.acc.interval}s")
+        else:
+            delay = min(600, self.acc.poll_interval * 2 ** min(self.feed_fails, 6))
+        self.feed_retry = time.monotonic() + delay
+        self.board.root(self.acc.name, feed="retrying", feed_error=str(e)[-200:])
+        if sign_in_expired(e) or isinstance(e, AuthError):
+            self.board.account(attention="sign-in expired")
+        (log.warning if self.feed_fails == 1 or isinstance(e, AuthError) else log.debug)(
+            "Drive change feed: %s (retry in %ds)", e, delay)
+
+    def _sync_failed(self, e: Exception):
+        self.eng = None                         # reload from the DB next time
+        self.fails += 1
+        self.retry_at = time.monotonic() + min(self.acc.interval, 10 * 2 ** min(self.fails, 5))
+        log.error("sync failed: %s", e)
+        self.board.root(self.acc.name, state="error", error=str(e)[-300:], error_time=time.time())
+        if "Safety stop" in str(e):
+            notify("Google Drive — sync paused", str(e))
+        elif sign_in_expired(e):
+            notify_reconnect(self.acc)
+            self.board.account(attention="sign-in expired")
+
+    def _targeted(self):
+        acc = self.acc
+        now = time.monotonic()
+        events, busy = self._local_events()
+        for p in [p for p, t in self.deferred.items() if t <= now]:
+            del self.deferred[p]
+            events.setdefault(p, False)
+        if not events and not self.pending:
+            return
+        dirs: set[str] = set()
+        fresh: set[str] = set()
+        try:
+            with SYNC_SLOTS, Locked(acc):
+                eng = self._engine()
+                for raw, closed in events.items():
+                    p = raw[:-len(STUB_EXT)] if raw.endswith(STUB_EXT) else raw
+                    verdict, wait = eng.local_verdict(p, closed)
+                    if verdict == "changed":
+                        dirs.add(parent(p))
+                        if closed:
+                            fresh.add(p)
+                    elif verdict == "settling":
+                        self.deferred[p] = time.monotonic() + wait + 0.2
+                n_local = len(dirs)
+                if self.pending:
+                    dirs |= eng.dirs_for_changes(self.pending, self._root())
+                if dirs:
+                    self.board.root(acc.name, state="syncing", phase="changes")
+                    log.info("changes (%d local, %d Drive) -> syncing %s", len(events), len(self.pending),
+                             ", ".join(sorted(d or "/" for d in dirs))[:300])
+                    log.debug("%d folder(s) from local events, %d busy path(s)", n_local, len(busy))
+                    eng.sync(dirs=dirs, fresh=fresh, busy=busy)
+                    self._defer(eng.deferred)
+                    self._synced(eng, full=False)
+        except ScopeTooBig:
+            log.info("many folders changed; running a full sync instead")
+            self.full_requested = True
+            return
+        except Exception as e:
+            for raw in events:                  # look at them again after the backoff
+                self.deferred.setdefault(raw[:-len(STUB_EXT)] if raw.endswith(STUB_EXT) else raw, 0.0)
+            self._sync_failed(e)
+            return
+        if self.pending_token:
+            self._set_token(self.pending_token)
+        self.pending, self.pending_token = [], None
+        self.fails = 0
+
+
+# ───────────────────────────── backups ─────────────────────────────
+class BackupJob:
+    """This PC's folders -> My Drive/Computers/<name>/<folder>: a one-way mirror (rclone sync).
+    Changed files become new revisions, removed ones go to the Drive trash. inotify starts a sync
+    of just the changed folder within seconds; a full pass runs at start and every
+    full_sync_interval. A source that vanished or became empty is never mirrored."""
+    QUIET = 5.0
+    EXCLUDES = (".~lock.*#", "~$*", "*.part", "*.crdownload", "*.kate-swp", "*.swp", "*.swx", f"*{TMP_EXT}",
+                ".Trash-*/**")
+
+    def __init__(self, acc: Account, board=NO_BOARD):
+        self.acc = acc
+        self.board = board
+        self.proc: subprocess.Popen | None = None
+        self.title = f"{acc.name} › backup"
+        self.host = acc.backup_name or socket.gethostname()
+        self.sources = [Path(os.path.realpath(os.path.expanduser(s))) for s in acc.backup]
+        self.wake, self._stop = threading.Event(), threading.Event()
+        self.full_requested = True
+        self.watchers: dict[Path, Watcher] = {}
+        self.state_path = STATE_DIR / f"{acc.name}.backup.json"
+        try:
+            self.counts: dict[str, int] = json.loads(self.state_path.read_text())   # files per source
+        except (OSError, ValueError):
+            self.counts = {}
+
+    def request_full(self):
+        self.full_requested = True
+        self.wake.set()
+
+    def stop(self):
+        self._stop.set()
+        self.wake.set()
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def paused(self) -> bool:
+        return backup_pause_flag(self.acc.name).exists()
+
+    def publish(self, **fields):
+        self.board.backup(sources=[{"path": str(s), "files": self.counts.get(str(s)),
+                                    "dest": f"My Drive/{BACKUP_ROOT}/{self.host}/{s.name}"} for s in self.sources],
+                          **fields)
+
+    def dest(self, src: Path, rel: str = "") -> str:
+        base = f"{BACKUP_ROOT}/{self.host}/{src.name}"
+        return self.acc.rpath(join(base, rel) if rel else base)
+
+    def run(self):
+        for src in self.sources:
+            if src.is_dir():
+                try:
+                    self.watchers[src] = Watcher(src, self.wake)
+                except OSError as e:
+                    log.warning("backup: cannot watch %s (%s); it is backed up every %ss", src, e,
+                                self.acc.full_sync_interval)
+        log.info("backup of %s to %s", ", ".join(map(str, self.sources)), self.dest(Path("…")).rsplit("/", 1)[0])
+        self.publish(state="paused" if self.paused() else "starting", progress=None)
+        next_full = 0.0
+        try:
+            while not self._stop.is_set():
+                self.wake.clear()
+                if any(w.take_overflow() for w in self.watchers.values()):
+                    self.full_requested = True
+                if self.paused():                        # changes keep queueing in the watchers
+                    self.publish(state="paused", progress=None)
+                    self.wake.wait(3600)
+                    continue
+                if self.full_requested or time.monotonic() >= next_full:
+                    self.full_requested = False
+                    ok = all([self.sync(src, "", True) for src in self.sources])
+                    next_full = time.monotonic() + (self.acc.full_sync_interval if ok else self.acc.interval)
+                    if ok:
+                        self.publish(state="idle", progress=None, last_full=time.time(),
+                                     next_full=time.time() + next_full - time.monotonic())
+                else:
+                    for src, w in self.watchers.items():
+                        for rel, recursive in self.targets(src, w.take_entries(self.QUIET)):
+                            if self._stop.is_set():
+                                break
+                            self.sync(src, rel, recursive)
+                due = [t for t in (w.next_ready(self.QUIET) for w in self.watchers.values()) if t is not None]
+                self.wake.wait(0 if self.full_requested else
+                               min(max(min([next_full, *due]) - time.monotonic(), 0.05), 3600))
+        finally:
+            for w in self.watchers.values():
+                w.close()
+
+    @staticmethod
+    def targets(src: Path, events: dict[str, tuple[bool, bool]]) -> list[tuple[str, bool]]:
+        """What to mirror for these changed paths: a changed file -> its folder (one level); a new
+        folder -> that folder (whole); something deleted -> its folder (whole if it was a folder)."""
+        out: set[tuple[str, bool]] = set()
+        for rel, (_, was_dir) in events.items():
+            fp = src / rel
+            if fp.is_dir() and not fp.is_symlink():
+                out.add((rel, True))
+            elif fp.exists() or fp.is_symlink():
+                out.add((parent(rel), False))
+            else:
+                out.add((parent(rel), was_dir))
+        deep = {r for r, d in out if d}
+        return sorted((r, d) for r, d in out
+                      if not any(x != r and under(r, x) for x in deep) and (d or r not in deep))
+
+    def sync(self, src: Path, rel: str, recursive: bool) -> bool:
+        if not src.is_dir():
+            notify("Google Drive — backup paused", f"{src} is missing; its backup in Drive is left as it is.")
+            self.publish(state="error", error=f"{src} is missing", error_time=time.time())
+            return False
+        if not rel:                                     # full pass: guard against a vanished/empty source
+            n = sum(len(files) for _, _, files in os.walk(src))
+            if n == 0 and self.counts.get(str(src), 0) > 0:
+                notify("Google Drive — backup paused", f"{src} is empty now; its backup in Drive is left as it is.")
+                self.publish(state="error", error=f"{src} is empty", error_time=time.time())
+                return False
+            self.counts[str(src)] = n
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps(self.counts))
+        while rel and not (src / rel).is_dir():          # deleted folder: mirror the closest one left
+            rel, recursive = parent(rel), True
+        cap = max(25, self.counts.get(str(src), 0) // 2)
+        args = [RCLONE, "sync", str(src / rel) if rel else str(src), self.dest(src, rel),
+                "--max-delete", str(cap), "--skip-links", "-v", "--use-json-log", "--stats", "2s",
+                *(["--fast-list", "--track-renames"] if recursive else ["--max-depth", "1"]),
+                *(a for x in self.EXCLUDES for a in ("--exclude", x)), *BASE_FLAGS, *self.acc.rclone_args]
+        t = time.monotonic()
+        where = f"{src.name}/{rel}" if rel else src.name
+        new = upd = gone = moved = 0
+        errors: list[str] = []
+        self.publish(state="running", current=where, progress=None)
+        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                     stdin=subprocess.DEVNULL)
+        for line in self.proc.stderr:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                errors.append(line.strip())
+                continue
+            if "stats" in d:
+                st = d["stats"]
+                self.publish(state="running", current=where, progress={
+                    k: st.get(k) for k in ("bytes", "totalBytes", "transfers", "totalTransfers", "checks",
+                                           "totalChecks", "speed", "eta", "errors", "deletes")})
+            msg, obj = d.get("msg", ""), d.get("object") or ""
+            kind = ("new" if msg.startswith("Copied (new)") else "updated" if msg.startswith("Copied (") else
+                    "moved" if msg.startswith("Moved") else "removed" if msg.startswith("Deleted") else "")
+            if kind:
+                new, upd, moved, gone = new + (kind == "new"), upd + (kind == "updated"), \
+                    moved + (kind == "moved"), gone + (kind == "removed")
+                self.board.event(self.title, f"backup: {kind}", join(where, obj) if obj else where)
+            elif d.get("level") in ("error", "critical"):
+                errors.append(msg)
+            if self.paused() or self._stop.is_set():          # stop now; the next run picks up from here
+                self.proc.terminate()
+        rc = self.proc.wait()
+        if self.paused() or self._stop.is_set():
+            self.publish(state="paused" if self.paused() else "stopped", progress=None)
+            return False
+        if rc:
+            err = " / ".join(errors)[-400:] or f"rclone exited with {rc}"
+            if "max-delete" in err.lower() or "max delete" in err.lower():
+                notify("Google Drive — backup paused", f"Backing up {where} would delete more than {cap} files "
+                                                       "in Drive; nothing was deleted. Check the folder.")
+            elif sign_in_expired(RuntimeError(err)):
+                notify_reconnect(self.acc)
+                self.board.account(attention="sign-in expired")
+            log.error("backup of %s failed: %s", where, err)
+            self.publish(state="error", error=err, error_time=time.time(), progress=None)
+            return False
+        if new or upd or gone or moved or not rel:
+            log.info("backup of %s: %d new, %d updated, %d moved, %d removed (%.0fs)",
+                     where, new, upd, moved, gone, time.monotonic() - t)
+        self.publish(state="idle", error="", current="", progress=None, last_run=time.time())
+        return True
+
+
+# ───────────────────────────── CLI ─────────────────────────────
+def resolve(accs: dict[str, Account], path: str) -> tuple[Account, str]:
+    """The sync root a path belongs to (a section of an account, or the account) and the path in it."""
+    ap = Path(os.path.realpath(path))
+    for root in all_roots(accs):
+        try:
+            rel = str(ap.relative_to(root.local))
+        except ValueError:
+            continue
+        rel = "" if rel == "." else rel
+        if rel.endswith(STUB_EXT):
+            rel = rel[:-len(STUB_EXT)]
+        return root, rel
+    die(f"{path} is not inside a synced Google Drive folder")
+
+
+def account_of(accs: dict[str, Account], path: str) -> Account | None:
+    """The configured account whose folder contains `path` (also its section folders)."""
+    ap = Path(os.path.realpath(path))
+    return next((a for a in accs.values() if ap == a.local or a.local in ap.parents), None)
+
+
+def open_browser(acc: Account, url: str):
+    if acc.email:
+        url += ("&" if "?" in url else "?") + "authuser=" + acc.email
+    subprocess.Popen([*acc.browser, url], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def xdg_open(fp: Path):
+    subprocess.Popen(["xdg-open", str(fp)], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_sync(accs, args):
+    failed = []
+    for n in args.accounts or list(accs):
+        acc = accs.get(n) or die(f"unknown account {n}")
+        prepare_layout(acc)
+        for root in sync_roots(acc, refresh=True):
+            try:
+                with Locked(root):
+                    Engine(root, DB(root.db_path)).sync(force=args.force)
+            except Exception as e:
+                log.error("%s: %s", root.title, e)
+                failed.append(root.title)
+    if failed:
+        die(f"sync failed for {', '.join(failed)}")
+
+
+def google_sign_in(acc: Account, client: list[str]) -> str:
+    """`rclone authorize drive [ID SECRET]`, its consent page opened in the account's browser
+    (profile); returns the token JSON once the user approved (dies after 10 minutes)."""
+    p = subprocess.Popen([RCLONE, "authorize", "drive", *client, "--auth-no-open-browser",
+                          *BASE_FLAGS, *acc.rclone_args],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, stdin=subprocess.DEVNULL)
+    timer = threading.Timer(600, p.kill)                # nobody approved within 10 minutes
+    timer.start()
+    out, opened = [], False
+    for line in p.stdout:
+        out.append(line)
+        m = re.search(r"(http://127\.0\.0\.1:\d+/auth\?state=\S+)", line)
+        if m and not opened:
+            opened = True
+            subprocess.Popen([*acc.browser, m.group(1)], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"{acc.name}: approve access for {acc.email or acc.remote} in the browser window that opened\n"
+                  f"  (if nothing opened, visit {m.group(1)} in the browser where that account is signed in)")
+            notify("Google Drive", f"Approve access for {acc.email or acc.name} in the browser window that opened")
+    p.wait()
+    timer.cancel()
+    m = re.search(r"--->\s*(\{.*?\})\s*<---End paste", "".join(out), re.S)
+    if p.returncode or not m:
+        die(f"{acc.name}: sign-in did not complete (no approval within 10 minutes, or it was refused)")
+    return m.group(1)
+
+
+def default_client() -> Path:
+    return CONFIG_PATH.with_name("oauth-client.json")
+
+
+# Chromium-family browsers: their "Local State" lists the profiles and the Google account in each.
+BROWSERS = (("google-chrome", ("google-chrome-stable", "google-chrome")),
+            ("google-chrome-beta", ("google-chrome-beta",)),
+            ("chromium", ("chromium", "chromium-browser")),
+            ("BraveSoftware/Brave-Browser", ("brave", "brave-browser")),
+            ("microsoft-edge", ("microsoft-edge-stable", "microsoft-edge")),
+            ("vivaldi", ("vivaldi-stable", "vivaldi")))
+
+
+def browser_for(email: str, config_home: Path | None = None) -> list[str]:
+    """The command that opens URLs in the browser profile where `email` is signed in, else the
+    default browser."""
+    config_home = config_home or Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+    for folder, exes in BROWSERS:
+        exe = next((shutil.which(e) for e in exes if shutil.which(e)), None)
+        try:
+            profiles = json.loads((config_home / folder / "Local State").read_text())["profile"]["info_cache"]
+        except (OSError, ValueError, KeyError):
+            continue
+        for directory, info in profiles.items():
+            if exe and email and info.get("user_name", "").casefold() == email.casefold():
+                return [exe, f"--profile-directory={directory}"]
+    return ["xdg-open"]
+
+
+def read_client(path: Path) -> tuple[str, str]:
+    """client_id and client_secret of a Google OAuth "Desktop app" client (its downloaded JSON)."""
+    try:
+        c = json.loads(path.read_text())
+        c = c.get("installed") or c.get("web") or c
+        return c["client_id"], c["client_secret"]
+    except (OSError, ValueError, KeyError):
+        die(f"No usable OAuth client at {path}. Create a 'Desktop app' client in Google Cloud and "
+            "download its JSON (see docs/google-oauth-client.md), then pass it with --client FILE.")
+
+
+def home_relative(p: Path) -> str:
+    return "~/" + str(p.relative_to(HOME)) if HOME in p.parents else str(p)
+
+
+def config_add_account(acc: Account):
+    """Append an [accounts.NAME] block to the config (created if needed); other lines untouched."""
+    block = [f"[accounts.{acc.name}]", f"remote   = {toml_value(acc.remote)}",
+             f"local    = {toml_value(home_relative(acc.local))}", f"email    = {toml_value(acc.email)}",
+             f"browser  = {toml_value(acc.browser)}"]
+    if acc.sections:
+        block.append("sections = true")
+    if acc.backup:
+        block.append(f"backup   = {toml_value(acc.backup)}")
+    text = CONFIG_PATH.read_text() if CONFIG_PATH.exists() else CONFIG_HEADER
+    text = text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n"
+    if acc.name not in tomllib.loads(text).get("accounts", {}):
+        raise ValueError("config edit failed")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def cmd_add_account(accs, args):
+    """Connect a Google account: rclone remote signed in with your own OAuth client (consent page
+    in the browser profile of that account), [accounts.NAME] in the config, desktop integration,
+    first sync (placeholders only) and the systemd service."""
+    name = args.name
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        die("Account names may contain letters, digits, '-' and '_' only.")
+    if name in accs:
+        die(f"There already is an account '{name}' in {CONFIG_PATH}.")
+    email = args.email or input(f"Google account (email) for '{name}': ").strip()
+    keep = default_client()
+    client_file = Path(os.path.expanduser(args.client)) if args.client else keep
+    cid, secret = read_client(client_file)
+    if client_file.resolve() != keep.resolve() and not keep.exists():
+        keep.parent.mkdir(parents=True, exist_ok=True)                 # kept for the next accounts
+        shutil.copyfile(client_file, keep)
+        keep.chmod(0o600)
+    remote = args.remote or f"gdrive-{name}"
+    local = Path(os.path.realpath(os.path.expanduser(args.local or f"~/GoogleDrive/{name[:1].upper()}{name[1:]}")))
+    browser = args.browser.split() if args.browser else browser_for(email)
+    acc = Account(name=name, remote=f"{remote}:", local=local, email=email, browser=browser,
+                  sections=not args.flat, backup=[home_relative(Path(os.path.realpath(os.path.expanduser(b))))
+                                                  for b in args.backup or []])
+    if any(a.local == local or a.local in local.parents or local in a.local.parents for a in accs.values()):
+        die(f"{local} overlaps the folder of another account.")
+    existing = json.loads(rclone(acc, "config", "dump") or "{}")
+    if remote in existing and not args.reuse_remote:
+        die(f"An rclone remote '{remote}' already exists: pick another name with --remote, "
+            "or use it as is with --reuse-remote.")
+    print(f"Account '{name}' ({email}) -> {local}\n  browser: {' '.join(browser)}")
+    if remote not in existing:
+        token = google_sign_in(acc, [cid, secret])
+        rclone(acc, "config", "create", remote, "drive", f"client_id={cid}", f"client_secret={secret}",
+               "scope=drive", f"token={token}", "--non-interactive")
+    try:
+        about = json.loads(rclone(acc, "about", "--json", acc.remote) or "{}")
+        print(f"  connected: {human(about.get('used', 0))} used in Google Drive")
+    except (RuntimeError, ValueError) as e:
+        die(f"The rclone remote '{remote}' was created but Google Drive can't be read ({e}). Is the Google "
+            "Drive API enabled in your Cloud project, and is this account a test user of the app?")
+    config_add_account(acc)
+    print(f"  added [accounts.{name}] to {CONFIG_PATH}")
+    data = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+    if acc.sections:
+        prepare_layout(acc)
+    else:
+        set_folder_icon(acc.local, FOLDER_ICON)
+    add_places(data, {name: acc})
+    if not args.no_sync:
+        print("  first sync (placeholders only, nothing is downloaded)…")
+        cmd_sync({name: acc}, argparse.Namespace(accounts=[name], force=False))
+    if not args.no_service and shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        ok = subprocess.run(["systemctl", "--user", "enable", "--now", f"gdrive-od@{name}"],
+                            capture_output=True).returncode == 0
+        print(f"  {'started' if ok else 'could not start'} the service gdrive-od@{name}")
+    print(f"Done. Your files are in {acc.local}.")
+
+
+def cmd_reconnect(accs, args):
+    """Sign an account in to Google again (expired or revoked token): `rclone authorize` with the
+    remote's own OAuth client, consent page opened in that account's browser profile, new token
+    stored in the rclone remote, running daemon told to sync."""
+    targets: list[Account] = []
+    for a in args.targets or list(accs):
+        acc = accs.get(a) or (account_of(accs, a) if os.path.exists(a) else None) or die(f"unknown account {a}")
+        if acc not in targets:
+            targets.append(acc)
+    for acc in targets:
+        name, _ = split_remote(acc.remote)
+        base = name.split(",")[0]
+        params = (json.loads(rclone(acc, "config", "dump")).get(base) or {}) if name else {}
+        if params.get("type") != "drive":
+            die(f"{acc.name}: {acc.remote} is not a Google Drive rclone remote")
+        client = [params["client_id"], params["client_secret"]] \
+            if params.get("client_id") and params.get("client_secret") else []
+        token = google_sign_in(acc, client)
+        rclone(acc, "config", "update", base, f"token={token}", "--non-interactive")
+        log.info("%s: reconnected", acc.name)
+        notify("Google Drive", f"{acc.name} is connected again")
+        unit = f"gdrive-od@{acc.name}"
+        if shutil.which("systemctl") and subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit]).returncode == 0:
+            subprocess.run(["systemctl", "--user", "reload", unit], capture_output=True)   # SIGUSR1: sync now
+
+
+def daemon_pid(name: str) -> int | None:
+    """PID of the running daemon of account `name` (from its status file), if it is alive."""
+    try:
+        data = json.loads(status_path(name).read_text())
+        pid = int(data["pid"])
+        if data.get("stopped"):
+            return None
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError, KeyError):
+        return None
+    return pid if b"daemon" in cmdline and name.encode() in cmdline else None
+
+
+def signal_daemon(name: str, sig: int) -> bool:
+    pid = daemon_pid(name)
+    if pid:
+        os.kill(pid, sig)
+    return pid is not None
+
+
+def cmd_backup(accs, args):
+    """gdrive-od backup pause|resume|now [ACCOUNT...]"""
+    for acc in [accs.get(a) or die(f"unknown account {a}") for a in args.accounts] or \
+               [a for a in accs.values() if a.backup]:
+        flag = backup_pause_flag(acc.name)
+        if args.action == "pause":
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            flag.touch()
+        elif args.action == "resume":
+            flag.unlink(missing_ok=True)
+        running = signal_daemon(acc.name, signal.SIGUSR2 if args.action != "now" else signal.SIGUSR1)
+        print(f"{acc.name}: backup {args.action}{'' if running else ' (the sync service is not running)'}")
+
+
+def cmd_daemon(accs, args):
+    """One process per account: a Daemon thread per sync root (My Drive, Shared with me, each
+    Shared drive) and the backup job. SIGUSR1 = full sync of everything; Shared drives you join
+    later are picked up hourly and on SIGUSR1."""
+    acc = accs.get(args.account) or die(f"unknown account {args.account}")
+    prepare_layout(acc)
+    board = StatusBoard(acc)
+    workers: dict[str, object] = {}
+    threads: list[threading.Thread] = []
+
+    def start(key: str, w):
+        workers[key] = w
+        t = threading.Thread(target=w.run, name=w.title if isinstance(w, BackupJob) else w.acc.title, daemon=True)
+        t.start()
+        threads.append(t)
+
+    for root in sync_roots(acc, refresh=True):
+        start(root.name, Daemon(root, board=board))
+    if acc.backup:
+        start("backup", BackupJob(acc, board=board))
+    stop, refresh = threading.Event(), threading.Event()
+    threading.Thread(target=board.run, args=(stop,), name="status", daemon=True).start()
+
+    def on_usr1(*_):
+        refresh.set()
+        for w in workers.values():
+            w.request_full()
+
+    def on_usr2(*_):                    # backup paused/resumed (gdrive-od backup pause|resume)
+        job = workers.get("backup")
+        if job:
+            job.wake.set() if job.paused() else job.request_full()
+
+    signal.signal(signal.SIGUSR1, on_usr1)
+    signal.signal(signal.SIGUSR2, on_usr2)
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    next_refresh = time.monotonic() + 3600
+    try:
+        while not stop.is_set() and any(t.is_alive() for t in threads):
+            stop.wait(1)
+            if acc.sections and acc.shared_drives and (refresh.is_set() or time.monotonic() > next_refresh):
+                refresh.clear()
+                next_refresh = time.monotonic() + 3600
+                for root in sync_roots(acc, refresh=True):
+                    if root.name not in workers:
+                        log.info("new Shared drive: %s", root.title)
+                        start(root.name, Daemon(root, board=board))
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    for w in workers.values():
+        w.stop()
+    for t in threads:
+        t.join(60)
+    board.write(stopped=time.time())
+    log.info("daemon stopped for %s", acc.name)
+
+
+def _group(accs, paths):
+    out: dict[str, tuple[Account, list[str]]] = {}
+    for p in paths:
+        acc, rel = resolve(accs, p)
+        out.setdefault(acc.name, (acc, []))[1].append(rel)
+    return out.values()
+
+
+def cmd_pin(accs, args):
+    for acc, rels in _group(accs, args.paths):
+        with Locked(acc):
+            db = DB(acc.db_path)
+            eng = Engine(acc, db)
+            targets = []
+            for rel in rels:
+                if rel == "" or eng.real_path(rel).is_dir():
+                    db.add_pin(rel)
+                    targets += [q for q, r in eng.S.items() if r.state == "cloud" and under(q, rel)]
+                elif rel in eng.S:
+                    targets.append(rel)
+            if len(targets) > 3:
+                notify("Google Drive", f"Downloading {len(targets)} files…")
+            done = 0
+            for q in targets:
+                try:
+                    eng.hydrate(q)
+                    done += 1
+                except Exception as e:
+                    log.error("%s", e)
+                    notify("Google Drive", f"Could not download {os.path.basename(q)} (offline?)")
+            db.save(eng.S)
+            if len(targets) > 3:
+                notify("Google Drive", f"{done} files are now available offline")
+
+
+def cmd_unpin(accs, args):
+    for acc, rels in _group(accs, args.paths):
+        with Locked(acc):
+            db = DB(acc.db_path)
+            eng = Engine(acc, db)
+            freed = 0
+            for rel in rels:
+                if rel == "" or eng.real_path(rel).is_dir():
+                    db.remove_pins_under(rel)
+                    eng.pins = db.pins()
+                    targets = [q for q, r in eng.S.items() if r.state == "local" and under(q, rel)]
+                else:
+                    targets = [rel]
+                if eng.pinned(rel):
+                    notify("Google Drive", f"'{os.path.basename(rel) or acc.name}' is inside a folder set to "
+                                           "'always keep offline'; it will be downloaded again.")
+                for q in targets:
+                    try:
+                        freed += eng.dehydrate(q)
+                    except Exception as e:
+                        log.error("%s", e)
+            db.save(eng.S)
+            if freed:
+                notify("Google Drive", f"Freed space: {freed} file(s) are now online-only")
+
+
+# Straight to the editor: drive.google.com/open?id= sends forms to the respondent view.
+EDITOR_URL = {"document": "https://docs.google.com/document/d/{}/edit",
+              "spreadsheet": "https://docs.google.com/spreadsheets/d/{}/edit",
+              "presentation": "https://docs.google.com/presentation/d/{}/edit",
+              "form": "https://docs.google.com/forms/d/{}/edit",
+              "drawing": "https://docs.google.com/drawings/d/{}/edit"}
+
+
+def link_url(data: dict) -> str:
+    """URL to open for a Google file link (.gdoc/.gsheet/...): the editor for known types."""
+    if data.get("type") in EDITOR_URL and data.get("id"):
+        return EDITOR_URL[data["type"]].format(urllib.parse.quote(data["id"]))
+    return data["url"]
+
+
+def cmd_open(accs, args):
+    fp = Path(args.path)
+    acc, rel = resolve(accs, args.path)
+    if fp.name.endswith(STUB_EXT):
+        with Locked(acc):
+            db = DB(acc.db_path)
+            eng = Engine(acc, db)
+            try:
+                eng.hydrate(rel)
+            except Exception as e:
+                log.error("%s", e)
+                die(f"Could not download {fp.name[:-len(STUB_EXT)]} — are you online?")
+            db.save(eng.S)
+        xdg_open(acc.local / rel)
+    elif fp.suffix in LINK_EXTS:
+        data = json.loads(fp.read_text())
+        open_browser(accs.get(data.get("account"), acc), link_url(data))
+    else:
+        xdg_open(fp)
+
+
+SECTION_URLS = {MY_DRIVE: "https://drive.google.com/drive/my-drive",
+                SHARED: "https://drive.google.com/drive/shared-with-me",
+                DRIVES: "https://drive.google.com/drive/shared-drives",
+                COMPUTERS: "https://drive.google.com/drive/my-drive"}     # backups live in My Drive/Computers
+
+
+def cmd_web(accs, args):
+    owner = account_of(accs, args.path)
+    ap = Path(os.path.realpath(args.path))
+    if owner and owner.sections and (ap == owner.local or ap.parent == owner.local or COMPUTERS in ap.parts):
+        part = ap.relative_to(owner.local).parts[:1]           # the account folder or a section folder
+        return open_browser(owner, SECTION_URLS.get(part[0] if part else MY_DRIVE, SECTION_URLS[MY_DRIVE]))
+    acc, rel = resolve(accs, args.path)
+    row = DB(acc.db_path).load().get(rel)
+    if rel == "":
+        url = {"shared": SECTION_URLS[SHARED],
+               "drive": f"https://drive.google.com/drive/folders/{acc.ref}"}.get(acc.section, SECTION_URLS[MY_DRIVE])
+    elif not row or not row.rid:
+        die("This item has not been synced to Drive yet.")
+    elif row.kind == "dir":
+        url = f"https://drive.google.com/drive/folders/{row.rid}"
+    elif row.kind == "gdoc":
+        url = f"https://drive.google.com/open?id={row.rid}"
+    else:
+        url = f"https://drive.google.com/file/d/{row.rid}/view"
+    open_browser(acc, url)
+
+
+def cmd_status(accs, args):
+    for p in args.paths:
+        owner = account_of(accs, p)
+        if owner and owner.sections and Path(os.path.realpath(p)) in (owner.local, owner.local / DRIVES):
+            for root in sync_roots(owner):                       # the account folder: every section
+                if Path(os.path.realpath(p)) in root.local.parents:
+                    S = DB(root.db_path).load()
+                    cnt = {k: sum(1 for r in S.values() if r.state == k) for k in ("local", "cloud", "gdoc")}
+                    print(f"{root.title}: {cnt['local']} offline, {cnt['cloud']} online-only, "
+                          f"{cnt['gdoc']} Google files")
+            continue
+        acc, rel = resolve(accs, p)
+        db = DB(acc.db_path)
+        S, pins = db.load(), db.pins()
+        if rel == "" or (acc.local / rel).is_dir():
+            sub = [r for r in S.values() if under(r.path, rel) and r.kind != "dir"]
+            cnt = {k: sum(1 for r in sub if r.state == k) for k in ("local", "cloud", "gdoc")}
+            pinned = any(under(rel, x) for x in pins)
+            print(f"{p}: {cnt['local']} offline, {cnt['cloud']} online-only, {cnt['gdoc']} Google files"
+                  f"{'  [always keep offline]' if pinned else ''}")
+        else:
+            row = S.get(rel)
+            print(f"{p}: {({'local': 'offline', 'cloud': 'online only', 'gdoc': 'Google file'}).get(row.state) if row else 'not synced yet'}")
+
+
+CONFIG_HEADER = """\
+# gdrive-od configuration: one [accounts.NAME] block per Google account.
+# Add accounts with:   gdrive-od add-account NAME --email you@gmail.com
+#
+# Keys of an account (only remote and local are required):
+#   remote   = "gdrive-NAME:"           rclone remote (type drive), optionally with a subfolder
+#   local    = "~/GoogleDrive/Name"     folder on this computer
+#   email    = "you@gmail.com"          picks the right Google login in the browser
+#   browser  = ["google-chrome-stable", "--profile-directory=Profile 1"]   opens Google Docs
+#   sections = true                     My Drive / Shared with me / Shared drives / Computers
+#   shared_with_me     = true
+#   shared_drives      = "all"          or ["Drive name", ...], or [] for none
+#   backup             = ["~/Documents"]   this PC -> My Drive/Computers/<host>/ (one-way mirror)
+#   backup_name        = "my-laptop"    the <host> folder name (default: this computer's name)
+#   poll_interval      = 15             seconds between Drive change checks
+#   full_sync_interval = 1800           full reconciliation (safety net) while live sync works
+#   interval           = 120            full-sync period when live sync is unavailable
+#   settle             = 10             seconds to wait for files still open for writing
+#   max_delete_pct     = 50             safety stop for mass deletions
+#   rclone_args        = ["--drive-acknowledge-abuse"]
+"""
+
+
+# Google file links: extension -> (MIME type, description, icon, fallback colour, fallback glyph).
+# Icons use Drive's own type names (application-vnd.google-apps.*), which icon themes such as
+# Tela/Papirus draw; setup-desktop installs simple hicolor fallbacks for themes that don't.
+GFILE_KINDS = {
+    ".gdoc": ("application/x-gdrive-document", "Google Docs document", "application-vnd.google-apps.document",
+              "#4285F4", '<rect x="15" y="22" width="18" height="2.5"/><rect x="15" y="27" width="18" height="2.5"/>'
+                         '<rect x="15" y="32" width="12" height="2.5"/>'),
+    ".gsheet": ("application/x-gdrive-spreadsheet", "Google Sheets spreadsheet",
+                "application-vnd.google-apps.spreadsheet", "#0F9D58",
+                '<path fill-rule="evenodd" d="M14 20h20v16H14zM16 22v3h6v-3zM24 22v3h8v-3zM16 27v3h6v-3z'
+                'M24 27v3h8v-3zM16 32v2h6v-2zM24 32v2h8v-2z"/>'),
+    ".gslides": ("application/x-gdrive-presentation", "Google Slides presentation",
+                 "application-vnd.google-apps.presentation", "#F4B400",
+                 '<path fill-rule="evenodd" d="M14 21h20v14H14zM16.5 23.5v9h15v-9z"/>'),
+    ".gform": ("application/x-gdrive-form", "Google Forms form", "application-vnd.google-apps.form", "#7248B9",
+               '<circle cx="17" cy="23" r="1.6"/><rect x="20" y="22" width="12" height="2.2"/>'
+               '<circle cx="17" cy="28.5" r="1.6"/><rect x="20" y="27.4" width="12" height="2.2"/>'
+               '<circle cx="17" cy="34" r="1.6"/><rect x="20" y="32.9" width="12" height="2.2"/>'),
+    ".gdraw": ("application/x-gdrive-drawing", "Google Drawings drawing", "application-vnd.google-apps.drawing",
+               "#DB4437", '<circle cx="20" cy="25" r="5"/><rect x="22" y="27" width="10" height="9" fill-opacity=".75"/>'),
+    ".gmap": ("application/x-gdrive-map", "Google My Maps map", "application-vnd.google-apps.map", "#34A853",
+              '<path d="M24 19a6 6 0 0 0-6 6c0 4.5 6 11 6 11s6-6.5 6-11a6 6 0 0 0-6-6zm0 8.2a2.2 2.2 0 1 1 0-4.4 '
+              '2.2 2.2 0 0 1 0 4.4z"/>'),
+    ".gsite": ("application/x-gdrive-site", "Google Sites site", "application-vnd.google-apps.site", "#3F51B5",
+               '<path fill-rule="evenodd" d="M14 20h20v16H14zM16 25v9h16v-9z"/>'),
+    ".gscript": ("application/x-gdrive-script", "Google Apps Script project", "application-vnd.google-apps.script",
+                 "#4285F4", '<path d="M19 22l-5 6 5 6 1.8-1.5-3.8-4.5 3.8-4.5zM29 22l-1.8 1.5 3.8 4.5-3.8 4.5 1.8 1.5 '
+                            '5-6z"/>'),
+    ".glink": ("application/x-gdrive-gfile", "Google Drive file (opens in the browser)",
+               "application-vnd.google-apps.unknown", "#5F6368",
+               '<rect x="15" y="22" width="18" height="2.5"/><rect x="15" y="28" width="18" height="2.5"/>'),
+}
+GFILE_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+ <path d="M10 4h20l10 10v28a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" fill="{colour}"/>
+ <path d="M30 4v8a2 2 0 0 0 2 2h8z" fill="#fff" fill-opacity=".35"/>
+ <g fill="#fff">{glyph}</g>
+</svg>
+"""
+FOLDER_ICON = "folder-gdrive"
+
+
+def mime_xml() -> str:
+    kinds = []
+    for ext, (mime, comment, icon, _, _) in sorted(GFILE_KINDS.items()):
+        parent = "" if mime == "application/x-gdrive-gfile" else \
+            '\n    <sub-class-of type="application/x-gdrive-gfile"/>'
+        kinds.append(f"""  <mime-type type="{mime}">
+    <comment>{comment}</comment>{parent}
+    <icon name="{icon}"/>
+    <generic-icon name="text-html"/>
+    <glob pattern="*{ext}"/>
+  </mime-type>
+""")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-gdrive-placeholder">
+    <comment>Google Drive file (online only)</comment>
+    <icon name="folder-cloud"/>
+    <glob pattern="*{STUB_EXT}"/>
+  </mime-type>
+{''.join(kinds)}</mime-info>
+"""
+
+
+def set_folder_icon(folder: Path, icon: str):
+    """Dolphin folder icon via the folder's .directory file (ignored by the sync); keeps its other keys."""
+    folder.mkdir(parents=True, exist_ok=True)
+    f = folder / ".directory"
+    lines = f.read_text().splitlines() if f.exists() else []
+    out, in_entry, done = [], False, False
+    for line in lines:
+        if line.startswith("["):
+            if in_entry and not done:
+                out.append(f"Icon={icon}")
+                done = True
+            in_entry = line.strip() == "[Desktop Entry]"
+        elif in_entry and line.startswith("Icon="):
+            line, done = f"Icon={icon}", True
+        out.append(line)
+    if in_entry and not done:
+        out.append(f"Icon={icon}")
+    elif not done:
+        out += ([""] if out else []) + ["[Desktop Entry]", f"Icon={icon}"]
+    f.write_text("\n".join(out) + "\n")
+
+
+def add_places(data: Path, accs: dict[str, Account]) -> list[str]:
+    """Dolphin's Places panel (user-places.xbel): one 'Google Drive · <folder>' entry per account,
+    appended after the user's own places. Existing entries for the same folder are left alone."""
+    xbel = data / "user-places.xbel"
+    if not xbel.exists():
+        return []
+    text = xbel.read_text()
+    added, entries = [], ""
+    for i, acc in enumerate(accs.values()):
+        href = escape(acc.local.as_uri(), {'"': "&quot;"})
+        if f'href="{href}"' in text:
+            continue
+        title = escape(f"Google Drive · {acc.local.name}")
+        entries += f""" <bookmark href="{href}">
+  <title>{title}</title>
+  <info>
+   <metadata owner="http://freedesktop.org">
+    <bookmark:icon name="{FOLDER_ICON}"/>
+   </metadata>
+   <metadata owner="http://www.kde.org">
+    <ID>{int(time.time())}/gdrive-od-{i}</ID>
+   </metadata>
+  </info>
+ </bookmark>
+"""
+        added.append(acc.local.name)
+    if entries:
+        cut = text.rfind("</bookmark>")
+        cut = cut + len("</bookmark>\n") if cut >= 0 else text.rfind("</xbel>")
+        backup = xbel.with_name(xbel.name + ".gdrive-od.bak")
+        if not backup.exists():
+            shutil.copy2(xbel, backup)
+        tmp = xbel.with_name(xbel.name + ".gdod-tmp")
+        tmp.write_text(text[:cut] + entries + text[cut:])
+        os.replace(tmp, xbel)
+    return added
+
+
+def cmd_setup_desktop(accs, args):
+    me = Path(sys.argv[0]).resolve()
+    data = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+    gfile_mimes = sorted({k[0] for k in GFILE_KINDS.values()})
+    files = {
+        data / "mime/packages/gdrive-ondemand.xml": mime_xml(),
+        data / "applications/gdrive-od-open.desktop": f"""[Desktop Entry]
+Type=Application
+Name=Google Drive (on demand)
+Exec={me} open %f
+MimeType=application/x-gdrive-placeholder;{''.join(m + ';' for m in gfile_mimes)}
+Icon=folder-cloud
+NoDisplay=true
+""",
+        data / "kio/servicemenus/gdrive-od.desktop": f"""[Desktop Entry]
+Type=Service
+MimeType=all/allfiles;inode/directory;
+Actions=pin;unpin;web;sync;reconnect
+X-KDE-Submenu=Google Drive
+Icon=folder-cloud
+
+[Desktop Action pin]
+Name=Make available offline
+Icon=folder-download
+Exec={me} pin %F
+
+[Desktop Action unpin]
+Name=Free up space (online only)
+Icon=folder-cloud
+Exec={me} unpin %F
+
+[Desktop Action web]
+Name=Open in Google Drive (browser)
+Icon=internet-web-browser
+Exec={me} web %f
+
+[Desktop Action sync]
+Name=Sync now
+Icon=view-refresh
+Exec={me} sync
+
+[Desktop Action reconnect]
+Name=Reconnect account (sign in to Google again)
+Icon=dialog-password
+Exec={me} reconnect %f
+""",
+        cfg / "systemd/user/gdrive-od@.service": f"""[Unit]
+Description=Google Drive on-demand sync (%i)
+After=network-online.target
+
+[Service]
+ExecStart={me} daemon %i
+ExecReload=/bin/kill -USR1 $MAINPID
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+""",
+    }
+    ui = me.with_name("gdrive-od-ui")
+    if ui.exists():                                     # the optional tray app / status window
+        files[data / "applications/gdrive-od-ui.desktop"] = f"""[Desktop Entry]
+Type=Application
+Name=Google Drive
+GenericName=Sync status and backup
+Comment=Accounts, backup progress, activity and settings of gdrive-od
+Exec={ui}
+Icon=folder-gdrive
+Categories=Network;FileTransfer;Utility;
+Keywords=drive;google;sync;backup;cloud;
+StartupNotify=false
+"""
+    for path, content in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        print(f"wrote {path}")
+    (data / "kio/servicemenus/gdrive-od.desktop").chmod(0o755)   # KF6 requires +x
+    icons = data / "icons/hicolor/scalable/mimetypes"            # fallbacks for themes without them
+    icons.mkdir(parents=True, exist_ok=True)
+    for _, _, icon, colour, glyph in GFILE_KINDS.values():
+        (icons / f"{icon}.svg").write_text(GFILE_ICON_SVG.format(colour=colour, glyph=glyph))
+    print(f"wrote Google file icons to {icons}")
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(CONFIG_HEADER)
+        print(f"wrote {CONFIG_PATH}")
+    for acc in accs.values():                                    # Drive icon on the account folders
+        if acc.sections:
+            prepare_layout(acc)                                  # migrates a flat My Drive first
+        else:
+            set_folder_icon(acc.local, FOLDER_ICON)
+        if acc.local.parent != HOME:
+            set_folder_icon(acc.local.parent, FOLDER_ICON)
+    if added := add_places(data, accs):
+        print(f"added to Dolphin's Places panel: {', '.join('Google Drive · ' + a for a in added)}")
+    for cmd in (["update-mime-database", str(data / "mime")],
+                ["update-desktop-database", str(data / "applications")],
+                *(["xdg-mime", "default", "gdrive-od-open.desktop", m]
+                  for m in ["application/x-gdrive-placeholder", *gfile_mimes]),
+                ["kbuildsycoca6"], ["kbuildsycoca5"], ["systemctl", "--user", "daemon-reload"]):
+        if shutil.which(cmd[0]):
+            subprocess.run(cmd, capture_output=True)
+    print("\nNext, for each Google account:  gdrive-od add-account NAME --email you@gmail.com")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="gdrive-od", description="Google Drive on-demand sync (rclone based)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--version", action="version", version=VERSION)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    s = sp.add_parser("sync"); s.add_argument("accounts", nargs="*"); s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_sync)
+    s = sp.add_parser("daemon"); s.add_argument("account"); s.set_defaults(fn=cmd_daemon)
+    for name, fn in (("pin", cmd_pin), ("unpin", cmd_unpin), ("status", cmd_status)):
+        s = sp.add_parser(name); s.add_argument("paths", nargs="+"); s.set_defaults(fn=fn)
+    for name, fn in (("open", cmd_open), ("web", cmd_web)):
+        s = sp.add_parser(name); s.add_argument("path"); s.set_defaults(fn=fn)
+    s = sp.add_parser("add-account", help="connect a Google account (sign-in, config, first sync, service)")
+    s.add_argument("name", help="short name, e.g. personal or work")
+    s.add_argument("--email", help="the Google account (also picks the browser profile)")
+    s.add_argument("--client", help="OAuth client JSON (default: oauth-client.json next to the config)")
+    s.add_argument("--local", help="folder for this account (default ~/GoogleDrive/Name)")
+    s.add_argument("--remote", help="rclone remote name (default gdrive-NAME)")
+    s.add_argument("--browser", help="command that opens Google Docs, e.g. 'firefox -P work'")
+    s.add_argument("--backup", action="append", metavar="FOLDER", help="back up this folder of this computer")
+    s.add_argument("--flat", action="store_true", help="only My Drive, without the section folders")
+    s.add_argument("--reuse-remote", action="store_true", help="use an existing rclone remote as it is")
+    s.add_argument("--no-sync", action="store_true", help="don't run the first sync now")
+    s.add_argument("--no-service", action="store_true", help="don't enable the systemd service")
+    s.set_defaults(fn=cmd_add_account)
+    s = sp.add_parser("backup"); s.add_argument("action", choices=["pause", "resume", "now"])
+    s.add_argument("accounts", nargs="*"); s.set_defaults(fn=cmd_backup)
+    s = sp.add_parser("reconnect"); s.add_argument("targets", nargs="*", metavar="ACCOUNT_OR_PATH")
+    s.set_defaults(fn=cmd_reconnect)
+    s = sp.add_parser("setup-desktop"); s.set_defaults(fn=cmd_setup_desktop)
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    accs = load_config(required=args.cmd not in ("setup-desktop", "add-account"))
+    args.fn(accs, args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,950 @@
+#!/usr/bin/env python3
+"""
+gdrive-od-ui — tray icon and window for gdrive-od (Google Drive on demand for KDE).
+
+  * Tray icon: up to date / syncing / needs attention / not running, with quick actions.
+  * Accounts: every account and section (My Drive, Shared with me, each Shared drive) with its
+    state, last sync, file counts and change-feed health; Sync now, Open, Reconnect, Start/Stop.
+  * Backup: live progress (files, bytes, speed, time left), folders to back up, pause/resume.
+  * Activity: recent uploads, downloads, deletions, conflicts and refusals.
+  * Settings: sections, Shared drives, Shared with me, check intervals, start at login.
+
+The sync services don't need this app. It reads their status files
+(~/.local/state/gdrive-ondemand/<account>.status.json) and acts through the gdrive-od command,
+the config file and the systemd user units, reusing gdrive-od's own code.
+Needs PySide6 (Arch: pyside6).
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from PySide6.QtCore import QFileSystemWatcher, QPointF, QRectF, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
+                               QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+                               QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+                               QProgressBar, QPushButton, QRadioButton, QScrollArea, QSpinBox,
+                               QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
+
+APP_ID = "gdrive-od-ui"
+core = None                     # the gdrive-od module (load_core)
+
+STATE_COLOURS = {"ok": "#2e9e44", "syncing": "#2f7fd8", "attention": "#e08a00", "error": "#d64541",
+                 "stopped": "#8a8f98"}
+SECTION_ICONS = {"my-drive": "folder-gdrive", "shared": "folder-publicshare", "drive": "folder-network"}
+ACTIVITY_FILTERS = {"Everything": None,
+                    "Uploads and backups": ("upload", "moved in Drive", "backup"),
+                    "Downloads": ("download", "moved"),
+                    "Deletions": ("deleted", "backup: removed"),
+                    "Needs a look": ("conflict", "put back", "kept here only")}
+
+
+def load_core():
+    """Import the gdrive-od script next to this file (or on PATH) as a module."""
+    for cand in (Path(__file__).resolve().parent / "gdrive-od", Path(shutil.which("gdrive-od") or "/nonexistent")):
+        if cand.is_file():
+            loader = importlib.machinery.SourceFileLoader("gdod", str(cand))
+            spec = importlib.util.spec_from_loader("gdod", loader)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["gdod"] = mod
+            loader.exec_module(mod)
+            return mod
+    sys.exit("gdrive-od-ui: cannot find the gdrive-od script")
+
+
+# ───────────────────────────── formatting ─────────────────────────────
+def ago(t) -> str:
+    if not t:
+        return "never"
+    d = time.time() - t
+    if d < 60:
+        return "just now"
+    if d < 3600:
+        return f"{int(d // 60)} min ago"
+    if d < 86400:
+        return f"{int(d // 3600)} h ago"
+    return time.strftime("%d %b %H:%M", time.localtime(t))
+
+
+def duration(s) -> str:
+    if s is None:
+        return "?"
+    s = int(s)
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    return f"{s // 3600} h {s % 3600 // 60:02d} min"
+
+
+def human(n) -> str:
+    return core.human(int(n or 0))
+
+
+# ───────────────────────────── model ─────────────────────────────
+class Model:
+    """Accounts from the config + what their daemons publish."""
+
+    def __init__(self):
+        self.accounts: dict = {}
+        self.status: dict[str, dict | None] = {}
+        self.alive: dict[str, bool] = {}
+        self.config_error = ""
+
+    def refresh(self):
+        try:
+            self.accounts = core.load_config() if core.CONFIG_PATH.exists() else {}
+            self.config_error = "" if self.accounts else f"No accounts configured in {core.CONFIG_PATH}"
+        except SystemExit:
+            self.config_error = f"Cannot read {core.CONFIG_PATH}"
+        except Exception as e:                              # a TOML typo, for instance
+            self.config_error = f"{core.CONFIG_PATH}: {e}"
+        for name in self.accounts:
+            try:
+                self.status[name] = json.loads(core.status_path(name).read_text())
+            except (OSError, ValueError):
+                self.status[name] = None
+            # a service started by an older gdrive-od publishes no status: ask systemd
+            self.alive[name] = core.daemon_pid(name) is not None or \
+                systemctl("is-active", "--quiet", unit(name), wait=True) == 0
+
+    def account_state(self, name: str) -> str:
+        st = self.status.get(name)
+        if not self.alive.get(name):
+            return "stopped"
+        if not st or not core.daemon_pid(name):
+            return "syncing"                                # running, no details (yet)
+        if st.get("attention"):
+            return "attention"
+        roots = list((st.get("roots") or {}).values())
+        backup = st.get("backup") or {}
+        if any(r.get("state") == "error" for r in roots) or backup.get("state") == "error":
+            return "error"
+        if any(r.get("state") in ("syncing", "starting") for r in roots) or backup.get("state") in ("running", "starting"):
+            return "syncing"
+        return "ok"
+
+    def overall(self) -> str:
+        states = [self.account_state(n) for n in self.accounts]
+        for s in ("error", "attention", "stopped", "syncing"):
+            if s in states:
+                return s
+        return "ok" if states else "stopped"
+
+    def summary(self) -> str:
+        if self.config_error:
+            return self.config_error
+        lines = []
+        for name in self.accounts:
+            state = self.account_state(name)
+            st = self.status.get(name) or {}
+            text = {"ok": "up to date", "syncing": "syncing…", "error": "has errors", "stopped": "not running",
+                    "attention": "sign in again (Reconnect)"}[state]
+            b = st.get("backup") or {}
+            if self.alive.get(name) and b.get("state") == "running" and b.get("progress"):
+                text += f" · backup {backup_percent(b['progress'])}%"
+            elif self.alive.get(name) and b.get("state") == "paused":
+                text += " · backup paused"
+            lines.append(f"{name}: {text}")
+        return "\n".join(lines)
+
+    def roots(self, name: str) -> list[dict]:
+        """Sections of an account: as published by its daemon, else as configured."""
+        st = self.status.get(name) or {}
+        published = (st.get("roots") or {}) if self.alive.get(name) else {}
+        return [{**published.get(r.name, {}), "name": r.name, "section": r.section or "my-drive",
+                 "local": str(r.local), "title": r.label.split(" › ", 1)[-1] if r.label else core.MY_DRIVE}
+                for r in core.sync_roots(self.accounts[name])]
+
+
+def backup_percent(p: dict) -> int:
+    total = p.get("totalBytes") or 0
+    if total:
+        return min(100, int(100 * (p.get("bytes") or 0) / total))
+    tt = p.get("totalTransfers") or 0
+    return min(100, int(100 * (p.get("transfers") or 0) / tt)) if tt else 0
+
+
+def backup_text(b: dict | None, alive: bool) -> str:
+    if not alive:
+        return "The sync service is not running."
+    if not b:
+        return "Starting…"
+    state = b.get("state")
+    p = b.get("progress") or {}
+    if state == "running" and p:
+        parts = [f"Backing up {b.get('current') or ''}".rstrip()]
+        if p.get("totalTransfers"):
+            parts.append(f"{p.get('transfers', 0):,} of {p['totalTransfers']:,} files")
+        if p.get("totalBytes"):
+            parts.append(f"{human(p.get('bytes'))} of {human(p['totalBytes'])}")
+        if p.get("speed"):
+            parts.append(f"{human(p['speed'])}/s")
+        if p.get("eta"):
+            parts.append(f"{duration(p['eta'])} left")
+        elif p.get("totalChecks") and not p.get("totalTransfers"):
+            parts.append(f"comparing {p.get('checks', 0):,} of {p['totalChecks']:,} files")
+        return " · ".join(parts)
+    if state == "running":
+        return f"Backing up {b.get('current') or ''}… (listing files)"
+    if state == "paused":
+        return "Paused. Changes are remembered and backed up when you resume."
+    if state == "error":
+        return f"Problem: {b.get('error') or 'unknown error'} ({ago(b.get('error_time'))})"
+    text = "Up to date"
+    if b.get("last_full"):
+        text += f" · last full check {ago(b['last_full'])}"
+    if b.get("next_full"):
+        text += f" · next in {duration(max(0, b['next_full'] - time.time()))}"
+    return text
+
+
+def root_status(r: dict, alive: bool) -> tuple[str, str]:
+    """(text, colour) for a section row."""
+    if not alive:
+        return "Not running", STATE_COLOURS["stopped"]
+    state = r.get("state")
+    if state == "error":
+        err = (r.get("error") or "").replace("rclone ", "").strip()
+        return f"Error: {err[:60] + '…' if len(err) > 60 else err}", STATE_COLOURS["error"]
+    if state == "syncing":
+        return ("Checking everything…" if r.get("phase") == "full" else "Syncing changes…"), STATE_COLOURS["syncing"]
+    if state in (None, "starting"):
+        return "Starting…", STATE_COLOURS["syncing"]
+    return "Up to date", STATE_COLOURS["ok"]
+
+
+# ───────────────────────────── icons ─────────────────────────────
+def state_icon(state: str, size: int = 64) -> QIcon:
+    """The Drive folder icon with a small state badge (✓ ↻ ! ■)."""
+    base = QIcon.fromTheme("folder-gdrive", QIcon.fromTheme("folder-cloud", QIcon.fromTheme("folder")))
+    pm = base.pixmap(size, size) if not base.isNull() else QPixmap(size, size)
+    if base.isNull():
+        pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    r = size * 0.42
+    box = QRectF(size - r - 1, size - r - 1, r, r)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(STATE_COLOURS[state]))
+    p.drawEllipse(box)
+    pen = QPen(QColor("white"), max(2.0, size / 16))
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    c, k = box.center(), r / 4.2
+    if state == "ok":
+        p.drawPolyline([QPointF(c.x() - k, c.y()), QPointF(c.x() - k / 3, c.y() + k * 0.8), QPointF(c.x() + k, c.y() - k * 0.7)])
+    elif state == "syncing":
+        p.drawArc(QRectF(c.x() - k, c.y() - k, 2 * k, 2 * k), 30 * 16, 280 * 16)
+    elif state in ("attention", "error"):
+        p.drawLine(QPointF(c.x(), c.y() - k), QPointF(c.x(), c.y() + k * 0.25))
+        p.drawPoint(QPointF(c.x(), c.y() + k * 0.85))
+    else:
+        p.drawLine(QPointF(c.x() - k * 0.7, c.y()), QPointF(c.x() + k * 0.7, c.y()))
+    p.end()
+    return QIcon(pm)
+
+
+def dot(colour: str) -> QIcon:
+    pm = QPixmap(12, 12)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(colour))
+    p.drawEllipse(1, 1, 10, 10)
+    p.end()
+    return QIcon(pm)
+
+
+# ───────────────────────────── actions ─────────────────────────────
+def run_tool(*args: str):
+    """Run a gdrive-od command in the background (it reports problems through notifications)."""
+    subprocess.Popen([sys.executable, core.__file__, *args], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def systemctl(*args: str, wait: bool = False) -> int:
+    if not shutil.which("systemctl"):
+        return 1
+    cmd = ["systemctl", "--user", *args]
+    if wait:
+        return subprocess.run(cmd, capture_output=True).returncode
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
+def unit(name: str) -> str:
+    return f"gdrive-od@{name}"
+
+
+def sync_now(name: str, model: Model):
+    if not core.signal_daemon(name, signal.SIGUSR1):        # not running: start it (it syncs at start)
+        systemctl("start", unit(name))
+
+
+def apply_config(name: str):
+    """Settings take effect when the account's service restarts (it finishes the current step first)."""
+    if systemctl("is-active", "--quiet", unit(name), wait=True) == 0:
+        systemctl("restart", unit(name))
+
+
+def open_path(path: str):
+    subprocess.Popen(["xdg-open", path], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ───────────────────────────── tabs ─────────────────────────────
+class AccountsTab(QWidget):
+    COLS = ["Section", "Status", "Last sync", "Offline", "Online only", "Google files", "Drive changes"]
+
+    def __init__(self, model: Model):
+        super().__init__()
+        self.model = model
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(self.COLS)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.itemDoubleClicked.connect(lambda it, _c: self.open_folder())
+        self.tree.currentItemChanged.connect(lambda *_: self.update_buttons())
+        hdr = self.tree.header()
+        hdr.setStretchLastSection(False)
+        for i in range(len(self.COLS)):
+            hdr.setSectionResizeMode(i, QHeaderView.Stretch if i == 0 else QHeaderView.ResizeToContents)
+        self.buttons = {}
+        row = QHBoxLayout()
+        for key, text, icon, fn in (("sync", "Sync now", "view-refresh", self.sync_now),
+                                    ("open", "Open folder", "folder-open", self.open_folder),
+                                    ("web", "Open in Google Drive", "internet-web-browser", self.open_web),
+                                    ("reconnect", "Reconnect…", "dialog-password", self.reconnect),
+                                    ("service", "Stop service", "media-playback-stop", self.toggle_service)):
+            b = QPushButton(QIcon.fromTheme(icon), text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+            self.buttons[key] = b
+        row.addStretch()
+        lay = QVBoxLayout(self)
+        self.banner = QLabel()
+        self.banner.setWordWrap(True)
+        self.banner.hide()
+        lay.addWidget(self.banner)
+        lay.addWidget(self.tree)
+        lay.addLayout(row)
+        self.items: dict[tuple, QTreeWidgetItem] = {}
+
+    def selected(self) -> tuple[str | None, dict | None]:
+        it = self.tree.currentItem()
+        if not it:
+            return (next(iter(self.model.accounts), None), None)
+        return it.data(0, Qt.UserRole), it.data(1, Qt.UserRole)
+
+    def refresh(self):
+        m = self.model
+        attention = [n for n in m.accounts if m.account_state(n) == "attention"]
+        self.banner.setVisible(bool(attention or m.config_error))
+        self.banner.setText(f"⚠ {m.config_error}" if m.config_error else
+                            f"⚠ Google signed out {', '.join(attention)}: select it and press Reconnect…")
+        seen = set()
+        for name, acc in m.accounts.items():
+            alive = m.alive.get(name)
+            st = m.status.get(name) or {}
+            top = self._item((name,), None)
+            state = m.account_state(name)
+            top.setText(0, f"{name}  —  {acc.email}" if acc.email else name)
+            top.setIcon(0, QIcon.fromTheme("goa-account-google", QIcon.fromTheme("folder-gdrive")))
+            top.setText(1, {"ok": "Up to date", "syncing": "Syncing…", "error": "Has errors", "stopped": "Not running",
+                            "attention": "Sign in again"}[state])
+            top.setIcon(1, dot(STATE_COLOURS[state]))
+            top.setText(2, f"running since {ago(st['started'])}" if alive and st.get("started") else "")
+            top.setData(0, Qt.UserRole, name)
+            top.setData(1, Qt.UserRole, None)
+            seen.add((name,))
+            for r in m.roots(name):
+                key = (name, r["name"])
+                it = self._item(key, top)
+                seen.add(key)
+                text, colour = root_status(r, alive)
+                c = r.get("counts") or {}
+                it.setText(0, r["title"])
+                it.setToolTip(0, f"{r['title']}\n{r['local']}")
+                it.setIcon(0, QIcon.fromTheme(SECTION_ICONS.get(r["section"], "folder")))
+                it.setText(1, text)
+                it.setIcon(1, dot(colour))
+                it.setToolTip(1, r.get("error") or text)
+                it.setText(2, ago(r.get("last_sync")) if alive else "")
+                for col, k in ((3, "local"), (4, "cloud"), (5, "gdoc")):
+                    it.setText(col, f"{c[k]:,}" if k in c else "")
+                    it.setTextAlignment(col, Qt.AlignRight | Qt.AlignVCenter)
+                feed = r.get("feed")
+                it.setText(6, {"live": "live", "retrying": "retrying", "off": "every few min"}.get(feed, "") if alive else "")
+                it.setToolTip(6, r.get("feed_error") or "")
+                it.setData(0, Qt.UserRole, name)
+                it.setData(1, Qt.UserRole, r)
+        for key in [k for k in self.items if k not in seen]:
+            it = self.items.pop(key)
+            (it.parent() or self.tree.invisibleRootItem()).removeChild(it)
+        self.update_buttons()
+
+    def _item(self, key: tuple, parent: QTreeWidgetItem | None) -> QTreeWidgetItem:
+        if key not in self.items:
+            it = QTreeWidgetItem(parent or self.tree)
+            self.items[key] = it
+            if parent is None:
+                f = it.font(0)
+                f.setBold(True)
+                it.setFont(0, f)
+                it.setExpanded(True)
+        return self.items[key]
+
+    def update_buttons(self):
+        name, _ = self.selected()
+        alive = bool(name and self.model.alive.get(name))
+        self.buttons["service"].setText("Stop service" if alive else "Start service")
+        self.buttons["service"].setIcon(QIcon.fromTheme("media-playback-stop" if alive else "media-playback-start"))
+        for b in self.buttons.values():
+            b.setEnabled(bool(name))
+
+    def sync_now(self):
+        name, _ = self.selected()
+        if name:
+            sync_now(name, self.model)
+
+    def open_folder(self):
+        name, r = self.selected()
+        if name:
+            open_path(r["local"] if r else str(self.model.accounts[name].local))
+
+    def open_web(self):
+        name, r = self.selected()
+        if name:
+            run_tool("web", r["local"] if r else str(self.model.accounts[name].local))
+
+    def reconnect(self):
+        name, _ = self.selected()
+        if name:
+            run_tool("reconnect", name)
+
+    def toggle_service(self):
+        name, _ = self.selected()
+        if name:
+            systemctl("stop" if self.model.alive.get(name) else "start", unit(name))
+
+
+class BackupTab(QWidget):
+    def __init__(self, model: Model):
+        super().__init__()
+        self.model = model
+        self.account = QComboBox()
+        self.account.currentIndexChanged.connect(lambda *_: self.refresh(force=True))
+        self.state = QLabel()
+        self.state.setWordWrap(True)
+        f = self.state.font()
+        f.setPointSizeF(f.pointSizeF() * 1.1)
+        self.state.setFont(f)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.dest = QLabel()
+        self.dest.setWordWrap(True)
+        self.dest.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.folders = QListWidget()
+        self.folders.setMaximumHeight(150)
+        self.folders.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.folders.itemDoubleClicked.connect(lambda it: open_path(it.data(Qt.UserRole)))
+        self.btn_pause = QPushButton(QIcon.fromTheme("media-playback-pause"), "Pause backup")
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        self.btn_now = QPushButton(QIcon.fromTheme("view-refresh"), "Back up now")
+        self.btn_now.clicked.connect(self.back_up_now)
+        self.btn_add = QPushButton(QIcon.fromTheme("list-add"), "Add folder…")
+        self.btn_add.clicked.connect(self.add_folder)
+        self.btn_remove = QPushButton(QIcon.fromTheme("list-remove"), "Stop backing up")
+        self.btn_remove.clicked.connect(self.remove_folder)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Account:"))
+        top.addWidget(self.account)
+        top.addStretch()
+        top.addWidget(self.btn_now)
+        top.addWidget(self.btn_pause)
+        side = QVBoxLayout()
+        side.addWidget(self.btn_add)
+        side.addWidget(self.btn_remove)
+        side.addStretch()
+        mid = QHBoxLayout()
+        mid.addWidget(self.folders)
+        mid.addLayout(side)
+        box = QGroupBox("Folders of this computer backed up to Google Drive")
+        bl = QVBoxLayout(box)
+        bl.addLayout(mid)
+        bl.addWidget(self.dest)
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(self.state)
+        lay.addWidget(self.bar)
+        lay.addWidget(box)
+        note = QLabel("Each folder is mirrored one-way within seconds of a change: changed files become new "
+                      "versions in Drive, deleted ones go to the Drive trash (kept 30 days). A folder that "
+                      "disappears or becomes empty is never mirrored.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: palette(placeholder-text);")
+        lay.addWidget(note)
+        lay.addStretch()
+        self._folders_key = None
+
+    def current(self) -> str | None:
+        return self.account.currentData()
+
+    def refresh(self, force: bool = False):
+        m = self.model
+        names = list(m.accounts)
+        if [self.account.itemData(i) for i in range(self.account.count())] != names:
+            keep = self.current()
+            self.account.blockSignals(True)
+            self.account.clear()
+            for n in names:
+                self.account.addItem(f"{n} ({m.accounts[n].email})" if m.accounts[n].email else n, n)
+            with_backup = [n for n in names if m.accounts[n].backup]
+            pick = keep if keep in names else (with_backup or names or [None])[0]
+            if pick:
+                self.account.setCurrentIndex(names.index(pick))
+            self.account.blockSignals(False)
+        name = self.current()
+        acc = m.accounts.get(name)
+        if not acc:
+            self.setEnabled(False)
+            return
+        self.setEnabled(True)
+        st = m.status.get(name) or {}
+        alive = bool(m.alive.get(name))
+        b = st.get("backup") if alive else None
+        paused = core.backup_pause_flag(name).exists()
+        if not acc.backup:
+            self.state.setText("No folders are backed up from this computer for this account. Add one below.")
+            self.bar.hide()
+        else:
+            pausing = paused and alive and (b or {}).get("state") != "paused"
+            self.state.setText("Pausing…" if pausing else backup_text(b, alive))
+            p = (b or {}).get("progress") or {}
+            running = alive and (b or {}).get("state") == "running"
+            self.bar.setVisible(running or (b or {}).get("state") == "paused")
+            if running and p:
+                self.bar.setRange(0, 100)
+                self.bar.setValue(backup_percent(p))
+            elif running:
+                self.bar.setRange(0, 0)                    # busy: listing / comparing
+        self.btn_pause.setText("Resume backup" if paused else "Pause backup")
+        self.btn_pause.setIcon(QIcon.fromTheme("media-playback-start" if paused else "media-playback-pause"))
+        self.btn_pause.setEnabled(bool(acc.backup))
+        self.btn_now.setEnabled(bool(acc.backup) and alive and not paused)
+        host = acc.backup_name or os.uname().nodename
+        self.dest.setText(f"Saved in Google Drive → My Drive › Computers › {host} (account {acc.email or name}).")
+        counts = {s.get("path"): s.get("files") for s in (b or {}).get("sources") or []}
+        key = (name, tuple(acc.backup), tuple(sorted(counts.items(), key=str)))
+        if force or key != self._folders_key:
+            self._folders_key = key
+            self.folders.clear()
+            for src in acc.backup:
+                path = str(Path(os.path.expanduser(src)).resolve())
+                n = counts.get(path)
+                it = QListWidgetItem(QIcon.fromTheme("folder"), f"{path}" + (f"   ({n:,} files)" if n else ""))
+                it.setData(Qt.UserRole, path)
+                self.folders.addItem(it)
+        self.btn_remove.setEnabled(self.folders.count() > 0)
+
+    def set_folders(self, folders: list[str]):
+        name = self.current()
+        core.config_set(name, "backup", folders)
+        apply_config(name)
+        self.model.refresh()
+        self.refresh(force=True)
+
+    def add_folder(self, path: str | None = None):
+        name = self.current()
+        if not name:
+            return
+        path = path or QFileDialog.getExistingDirectory(self, "Back up this folder to Google Drive", str(Path.home()))
+        if not path:
+            return
+        path = str(Path(path).resolve())
+        acc = self.model.accounts[name]
+        current = [str(Path(os.path.expanduser(s)).resolve()) for s in acc.backup]
+        problem = ("is already backed up" if path in current else
+                   "is inside your Google Drive folders" if any(Path(path) == a.local or a.local in Path(path).parents
+                                                                for a in self.model.accounts.values()) else
+                   "contains a folder that is already backed up" if any(Path(path) in Path(c).parents for c in current) else
+                   "is inside a folder that is already backed up" if any(Path(c) in Path(path).parents for c in current) else
+                   "has the same name as another backed-up folder" if any(Path(c).name == Path(path).name for c in current)
+                   else "")
+        if problem:
+            QMessageBox.warning(self, "Backup", f"{path} {problem}.")
+            return
+        home = str(Path.home())
+        self.set_folders([*acc.backup, "~" + path[len(home):] if path.startswith(home + "/") else path])
+
+    def remove_folder(self):
+        it = self.folders.currentItem() or (self.folders.item(0) if self.folders.count() == 1 else None)
+        name = self.current()
+        if not it or not name:
+            return
+        path = it.data(Qt.UserRole)
+        if QMessageBox.question(self, "Backup", f"Stop backing up {path}?\n\nThe copy already in Google Drive "
+                                "is kept; it just won't be updated any more.") != QMessageBox.Yes:
+            return
+        acc = self.model.accounts[name]
+        self.set_folders([s for s in acc.backup if str(Path(os.path.expanduser(s)).resolve()) != path])
+
+    def toggle_pause(self):
+        name = self.current()
+        if name:
+            run_tool("backup", "resume" if core.backup_pause_flag(name).exists() else "pause", name)
+            QTimer.singleShot(400, self.model_refresh)
+
+    def back_up_now(self):
+        name = self.current()
+        if name:
+            run_tool("backup", "now", name)
+
+    def model_refresh(self):
+        self.model.refresh()
+        self.refresh()
+
+
+class ActivityTab(QWidget):
+    COLS = ["Time", "Where", "What", "Item"]
+
+    def __init__(self, model: Model):
+        super().__init__()
+        self.model = model
+        self.filter = QComboBox()
+        self.filter.addItems(list(ACTIVITY_FILTERS))
+        self.filter.currentIndexChanged.connect(lambda *_: self.refresh(force=True))
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(self.fontMetrics().height() + 8)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        for i in range(3):
+            self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        self.table.cellDoubleClicked.connect(self.reveal)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Show:"))
+        top.addWidget(self.filter)
+        top.addStretch()
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(self.table)
+        self._key = None
+        self.rows: list[dict] = []
+
+    def entries(self) -> list[dict]:
+        out = []
+        for name, st in self.model.status.items():
+            locals_ = {r.get("title"): r.get("local") for r in ((st or {}).get("roots") or {}).values()}
+            for e in (st or {}).get("activity") or []:
+                out.append({**e, "local": locals_.get(e.get("where"))})
+        want = ACTIVITY_FILTERS[self.filter.currentText()]
+        if want:
+            out = [e for e in out if any(e.get("kind", "").startswith(w) for w in want)]
+        return sorted(out, key=lambda e: -e.get("t", 0))[:500]
+
+    def refresh(self, force: bool = False):
+        rows = self.entries()
+        key = (self.filter.currentText(), tuple((e.get("t"), e.get("path")) for e in rows[:50]), len(rows))
+        if not force and key == self._key:
+            return
+        self._key = key
+        self.rows = rows
+        self.table.setRowCount(len(rows))
+        for i, e in enumerate(rows):
+            vals = [time.strftime("%H:%M:%S" if time.time() - e["t"] < 86400 else "%d %b %H:%M",
+                                  time.localtime(e["t"])), e.get("where", ""), e.get("kind", ""), e.get("path", "")]
+            for j, v in enumerate(vals):
+                self.table.setItem(i, j, QTableWidgetItem(v))
+
+    def reveal(self, row: int, _col: int):
+        e = self.rows[row]
+        if not e.get("local") or "→" in e.get("path", ""):
+            return
+        p = Path(e["local"]) / e["path"]
+        target = p if p.exists() else Path(str(p) + ".gdcloud") if Path(str(p) + ".gdcloud").exists() else p.parent
+        if shutil.which("dolphin"):
+            subprocess.Popen(["dolphin", "--select", str(target)], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            open_path(str(target.parent))
+
+
+class AccountSettings(QGroupBox):
+    def __init__(self, name: str, model: Model):
+        super().__init__()
+        self.name, self.model = name, model
+        acc = model.accounts[name]
+        self.setTitle(f"{name}  —  {acc.email}" if acc.email else name)
+        form = QFormLayout(self)
+        self.sections = QCheckBox("Show My Drive, Shared with me, Shared drives and Computers as folders")
+        self.shared = QCheckBox("Show files shared with me")
+        self.all_drives = QRadioButton("All my Shared drives")
+        self.some_drives = QRadioButton("Only these:")
+        group = QButtonGroup(self)
+        group.addButton(self.all_drives)
+        group.addButton(self.some_drives)
+        self.drives = QListWidget()
+        self.drives.setMaximumHeight(170)
+        self.all_drives.toggled.connect(lambda on: self.drives.setEnabled(not on))
+        drives = core.cached_shared_drives(acc)
+        for d in sorted(drives, key=lambda d: d["name"].casefold()):
+            it = QListWidgetItem(d["name"].strip())
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if acc.shared_drives == "all" or d["name"].strip() in
+                             [str(x).strip() for x in acc.shared_drives or []] else Qt.Unchecked)
+            self.drives.addItem(it)
+        self.poll = QSpinBox()
+        self.poll.setRange(5, 3600)
+        self.poll.setSuffix(" s")
+        self.full = QSpinBox()
+        self.full.setRange(5, 1440)
+        self.full.setSuffix(" min")
+        self.login = QCheckBox("Start syncing this account when I log in")
+        for box in (self.poll, self.full):
+            box.setMaximumWidth(130)
+        self.sections.setChecked(acc.sections)
+        self.shared.setChecked(acc.shared_with_me)
+        (self.all_drives if acc.shared_drives == "all" else self.some_drives).setChecked(True)
+        self.drives.setEnabled(acc.shared_drives != "all")
+        self.poll.setValue(int(acc.poll_interval))
+        self.full.setValue(max(5, acc.full_sync_interval // 60))
+        self.login.setChecked(systemctl("is-enabled", "--quiet", unit(name), wait=True) == 0)
+        self.apply = QPushButton(QIcon.fromTheme("dialog-ok-apply"), "Apply")
+        self.apply.clicked.connect(self.save)
+        form.addRow(self.sections)
+        form.addRow(self.shared)
+        if drives:
+            form.addRow("Shared drives:", self.all_drives)
+            form.addRow("", self.some_drives)
+            form.addRow("", self.drives)
+        else:
+            form.addRow("Shared drives:", QLabel("none (or not listed yet)"))
+        form.addRow("Check Drive for changes every:", self.poll)
+        form.addRow("Full check every:", self.full)
+        form.addRow(self.login)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(self.apply)
+        form.addRow(row)
+
+    def wanted(self) -> dict:
+        drives = "all" if self.all_drives.isChecked() else [
+            self.drives.item(i).text() for i in range(self.drives.count())
+            if self.drives.item(i).checkState() == Qt.Checked]
+        return {"sections": self.sections.isChecked(), "shared_with_me": self.shared.isChecked(),
+                "shared_drives": drives, "poll_interval": self.poll.value(),
+                "full_sync_interval": self.full.value() * 60}
+
+    def save(self):
+        acc = self.model.accounts[self.name]
+        changes = {k: v for k, v in self.wanted().items()
+                   if v != {"sections": acc.sections, "shared_with_me": acc.shared_with_me,
+                            "shared_drives": acc.shared_drives, "poll_interval": int(acc.poll_interval),
+                            "full_sync_interval": acc.full_sync_interval}[k]}
+        if changes.get("sections") is False and acc.sections:
+            QMessageBox.information(self, "Settings", "Turning the folder layout off isn't supported here: "
+                                    "the files already live in “My Drive”. Leaving it on.")
+            changes.pop("sections")
+        for k, v in changes.items():
+            core.config_set(self.name, k, v)
+        if changes:
+            apply_config(self.name)
+        login = self.login.isChecked()
+        if login != (systemctl("is-enabled", "--quiet", unit(self.name), wait=True) == 0):
+            systemctl("enable" if login else "disable", unit(self.name))
+        self.model.refresh()
+        QMessageBox.information(self, "Settings", "Saved." + (" The account's sync service is restarting to use "
+                                "them." if changes and self.model.alive.get(self.name) else ""))
+
+
+class SettingsTab(QScrollArea):
+    def __init__(self, model: Model):
+        super().__init__()
+        self.model = model
+        self.setWidgetResizable(True)
+        self._names = None
+        self.refresh()
+
+    def refresh(self, force: bool = False):
+        names = list(self.model.accounts)
+        if names == self._names and not force:
+            return
+        self._names = names
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        for n in names:
+            lay.addWidget(AccountSettings(n, self.model))
+        app = QGroupBox("This app")
+        al = QVBoxLayout(app)
+        self.autostart = QCheckBox("Show the Google Drive icon in the system tray when I log in")
+        self.autostart.setChecked(autostart_file().exists())
+        self.autostart.toggled.connect(set_autostart)
+        al.addWidget(self.autostart)
+        cfg = QPushButton(QIcon.fromTheme("document-edit"), "Edit the config file…")
+        cfg.clicked.connect(lambda: open_path(str(core.CONFIG_PATH)))
+        al.addWidget(cfg, alignment=Qt.AlignLeft)
+        lay.addWidget(app)
+        lay.addStretch()
+        self.setWidget(inner)
+
+
+def autostart_file() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart" / f"{APP_ID}.desktop"
+
+
+def set_autostart(on: bool):
+    f = autostart_file()
+    if on:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(f"[Desktop Entry]\nType=Application\nName=Google Drive status\nExec={Path(__file__).resolve()} --tray\n"
+                     "Icon=folder-gdrive\nX-GNOME-Autostart-enabled=true\n")
+    else:
+        f.unlink(missing_ok=True)
+
+
+# ───────────────────────────── window and tray ─────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self, model: Model):
+        super().__init__()
+        self.model = model
+        self.setWindowTitle("Google Drive")
+        self.setWindowIcon(QIcon.fromTheme("folder-gdrive"))
+        self.tabs = QTabWidget()
+        self.accounts = AccountsTab(model)
+        self.backup = BackupTab(model)
+        self.activity = ActivityTab(model)
+        self.settings = SettingsTab(model)
+        self.tabs.addTab(self.accounts, QIcon.fromTheme("folder-gdrive"), "Accounts")
+        self.tabs.addTab(self.backup, QIcon.fromTheme("computer"), "Backup")
+        self.tabs.addTab(self.activity, QIcon.fromTheme("view-history", QIcon.fromTheme("document-open-recent")), "Activity")
+        self.tabs.addTab(self.settings, QIcon.fromTheme("configure"), "Settings")
+        self.setCentralWidget(self.tabs)
+        self.resize(920, 560)
+        self.quit_on_close = False
+
+    def refresh(self):
+        self.accounts.refresh()
+        self.backup.refresh()
+        self.activity.refresh()
+        self.settings.refresh()
+
+    def closeEvent(self, ev):
+        if self.quit_on_close:
+            QApplication.quit()
+        ev.accept()
+
+
+class App:
+    def __init__(self, show_window: bool):
+        self.model = Model()
+        self.model.refresh()
+        self.win = MainWindow(self.model)
+        self.tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = QSystemTrayIcon()
+            self.tray.activated.connect(self.on_tray)
+            self.menu = QMenu()
+            self.tray.setContextMenu(self.menu)
+            self.tray.show()
+        else:
+            self.win.quit_on_close = True
+            show_window = True
+        self.watcher = QFileSystemWatcher()
+        core.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.watcher.addPath(str(core.STATE_DIR))
+        self.watcher.directoryChanged.connect(lambda *_: self.refresh())
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(2000)
+        self.refresh()
+        if show_window:
+            self.show_window()
+
+    def refresh(self):
+        self.model.refresh()
+        state = self.model.overall()
+        if self.tray:
+            self.tray.setIcon(state_icon(state))
+            self.tray.setToolTip("Google Drive\n" + self.model.summary())
+            self.build_menu()
+        self.win.setWindowIcon(state_icon(state))
+        if self.win.isVisible():
+            self.win.refresh()
+
+    def build_menu(self):
+        m = self.menu
+        m.clear()
+        m.addAction(QIcon.fromTheme("folder-gdrive"), "Open Google Drive status", self.show_window)
+        m.addSeparator()
+        for name, acc in self.model.accounts.items():
+            sub = m.addMenu(dot(STATE_COLOURS[self.model.account_state(name)]), f"{name} — {acc.email or acc.remote}")
+            sub.addAction(QIcon.fromTheme("folder-open"), "Open folder", lambda a=acc: open_path(str(a.local)))
+            sub.addAction(QIcon.fromTheme("view-refresh"), "Sync now", lambda n=name: sync_now(n, self.model))
+            if acc.backup:
+                paused = core.backup_pause_flag(name).exists()
+                sub.addAction(QIcon.fromTheme("media-playback-start" if paused else "media-playback-pause"),
+                              "Resume backup" if paused else "Pause backup",
+                              lambda n=name, p=paused: run_tool("backup", "resume" if p else "pause", n))
+            if self.model.account_state(name) == "attention":
+                sub.addAction(QIcon.fromTheme("dialog-password"), "Reconnect…", lambda n=name: run_tool("reconnect", n))
+        m.addSeparator()
+        quit_action = QAction(QIcon.fromTheme("application-exit"), "Quit (syncing continues)", m)
+        quit_action.triggered.connect(QApplication.quit)
+        m.addAction(quit_action)
+
+    def on_tray(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if self.win.isVisible() and self.win.isActiveWindow():
+                self.win.hide()
+            else:
+                self.show_window()
+
+    def show_window(self):
+        self.win.refresh()
+        self.win.show()
+        self.win.raise_()
+        self.win.activateWindow()
+
+
+def main():
+    global core
+    core = load_core()
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_ID)
+    app.setApplicationDisplayName("Google Drive")
+    app.setDesktopFileName(APP_ID)
+    app.setQuitOnLastWindowClosed(False)
+    sock = QLocalSocket()                       # one instance: a second launch just shows the window
+    sock.connectToServer(APP_ID)
+    if sock.waitForConnected(300):
+        sock.write(b"show")
+        sock.waitForBytesWritten(300)
+        return 0
+    QLocalServer.removeServer(APP_ID)
+    server = QLocalServer()
+    server.listen(APP_ID)
+    ui = App(show_window="--tray" not in sys.argv)
+    server.newConnection.connect(lambda: (server.nextPendingConnection(), ui.show_window()))
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
