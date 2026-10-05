@@ -27,6 +27,7 @@ backed up to Drive.
 - [Uninstalling](#uninstalling)
 - [Development](#development)
 - [Limitations](#limitations)
+- [License](#license)
 
 ## Features
 
@@ -411,3 +412,7 @@ directory, never against your real Drive or desktop files:
   `interval` seconds.
 - Drive's real *Computers* page can't be written by third-party apps (see
   [Sections](#sections-my-drive-shared-with-me-shared-drives-computers)).
+
+## License
+
+[MIT](LICENSE) © 2026 Esteban Rodriguez
