@@ -45,8 +45,8 @@ backed up to Drive.
   `.gmap`, …). They open the document's editor in the browser.
 - **The Drive website's structure:** *My Drive*, *Shared with me*, every *Shared drive* you belong
   to, and *Computers*.
-- **Backups** of folders of your computer (Documents, Pictures, …) to Google Drive, mirrored
-  one-way within seconds of a change.
+- **Backups** of folders of your computer (Documents, Pictures, …) to Google Drive, kept in sync
+  both ways within seconds of a change. Every file stays on your computer.
 - **Dolphin integration:** status tags (`Offline`, `Online only`, `Google file`), a *Google Drive*
   context menu, and an entry per account in the Places panel.
 - **A tray app** with status, backup progress, recent activity and settings.
@@ -63,7 +63,7 @@ backed up to Drive.
    My Drive/          ◀──────────── │ Shared with me ─┼─ 3-way merge (Drive, last  │            Shared with me
    Shared with me/      placeholders│ Shared drive A ─┤   sync, disk) per section  │ ◀──────── Changes API
    Shared drives/A/     downloads   │ Shared drive B ─┘   + SQLite state           │  (every 15 s)
-   Computers/this-pc/ ─────────────▶│ Backup (rclone sync) ───────────────────────▶│ ─────────▶ My Drive/Computers/
+   Computers/this-pc/ ◀────────────▶│ Backed-up folders (same merge, all local) ◀─▶│ ◀────────▶ My Drive/Computers/
                                     │ status file ──▶ tray app                     │
                                     └──────────────────────────────────────────────┘
 ```
@@ -215,20 +215,27 @@ backup = ["~/Documents", "~/Pictures"]
 backup_name = "my-laptop"        # optional; default: this computer's name
 ```
 
-- Each folder is mirrored **one-way** to `My Drive/Computers/<backup_name>/<folder>`. Only the
-  changed folder is processed, within seconds of a change, and a full check runs at start and
-  every 30 minutes.
-- A changed file becomes a **new version** of the same Drive file (Drive keeps previous versions).
-  A deleted file goes to the **Drive trash**.
-- If a backed-up folder **disappears or becomes empty** (an unplugged disk, say), its backup is left
-  untouched and you get a notification. A single run never deletes more than half of a folder's
-  files.
+- Each folder is kept in sync **both ways** with `My Drive/Computers/<backup_name>/<folder>`, like
+  a section, except that every file stays on this computer (no placeholders, no status tags).
+  Changes are synced within seconds, and a full check runs at start and every 30 minutes.
+- **Moves and renames** of files and folders become the same move or rename in Drive (one
+  server-side move; nothing is uploaded again). A changed file becomes a **new version** of the
+  same Drive file (Drive keeps previous versions). A deleted file goes to the **Drive trash**.
+- **Files added or changed in Drive** (from your phone, say) are downloaded into the folder, and
+  files moved or deleted there are moved or deleted here (into your local trash).
+- If a backed-up folder **disappears or becomes empty** (an unplugged disk, say), it isn't synced,
+  its copy in Drive is left untouched, and you get a notification. A single sync never deletes more
+  than half of a folder's files.
+- The first sync of a folder adopts the copy already in Drive (same size and date = same file,
+  without reading it again). Where the two differ, this computer's version wins and the other one
+  stays in Drive's version history; files that only exist in Drive are downloaded.
 - Pause, resume or start a backup from the app, the tray menu, or
   `gdrive-od backup pause|resume|now [ACCOUNT]`. Changes made while paused are backed up on resume.
 - **To restore**, download the files from drive.google.com, or with
   `rclone copy gdrive-NAME:Computers/<backup_name>/<folder> <destination>`.
-- The first backup of a large folder takes a while: Drive accepts roughly one new file per
-  second, plus the time your upload bandwidth needs. Progress is shown in the app.
+- The first backup of a large folder takes a while: Drive accepts a few new files per second,
+  plus the time your upload bandwidth needs. Many new files go up in one rclone run, with
+  parallel transfers. Progress is shown in the app.
 
 ## The Google Drive app
 
@@ -320,7 +327,7 @@ Environment variables for special setups and tests: `GDOD_CONFIG` (config file),
 | `~/.config/gdrive-ondemand/config.toml` | Your accounts. |
 | `~/.config/gdrive-ondemand/oauth-client.json` | Your OAuth client (mode 600). |
 | `~/.config/rclone/rclone.conf` | rclone remotes and their tokens. |
-| `~/.local/state/gdrive-ondemand/` | Per section: `NAME.db` (sync state, SQLite), `NAME.lock`. Per account: `NAME.status.json` (for the app), `NAME.drives.json`, `NAME.backup.json`, `NAME.backup-paused`. |
+| `~/.local/state/gdrive-ondemand/` | Per section: `NAME.db` (sync state, SQLite), `NAME.lock`. Per account: `NAME.status.json` (for the app), `NAME.drives.json`, `NAME.backup-paused`. Per backed-up folder: `NAME.backup-HOST-FOLDER.db` and `.lock`. |
 | `~/.config/systemd/user/gdrive-od@.service` | The service template. |
 | `~/.local/share/kio/servicemenus/gdrive-od.desktop` | Dolphin's *Google Drive* menu. |
 | `~/.local/share/mime/packages/gdrive-ondemand.xml` | File types for placeholders and Google files. |
@@ -339,7 +346,7 @@ attributes `user.gdrive.id` and `user.gdrive.path`. **Google file links:** JSON 
   intended.
 - **Empty listings are never trusted.** If Drive returns nothing, or the local folder is suddenly
   empty (an unmounted disk, a deleted folder) while files were synced before, the sync refuses.
-  Backups do the same for a vanished or empty source folder.
+  Backed-up folders do the same, and one that vanished is never recreated.
 - **Conflicts keep both versions:** `name (conflict host date).ext`.
 - **Files being saved are left alone.** A path whose events are still arriving (an editor's
   "safe save" removes the file for a moment) is never taken as deleted.
@@ -402,8 +409,9 @@ directory, never against your real Drive or desktop files:
 
 - **Tested on** CachyOS (Arch) with KDE Plasma 6, rclone 1.75 and Python 3.14. The installer
   also handles apt, dnf and zypper, but those paths haven't been tried yet.
-- Each upload or download is one rclone call, so the first sync of many new files (copying a big
-  folder in, the first backup) takes about 1–2 s per file.
+- Each download, and each upload of a changed file, is one rclone call (about 1–2 s per file).
+  New files are uploaded in batches (one rclone run for up to 500 files), but downloads are not, so
+  the first sync of a Drive folder with many files takes a while.
 - Google Docs need an internet connection to open. Chrome's "Docs Offline" helps.
 - Placeholders keep the `.gdcloud` suffix, so Dolphin shows a cloud icon rather than the file type.
 - Drive allows two items with the same name in one folder; only one of them is synced (use

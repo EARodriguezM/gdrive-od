@@ -491,9 +491,11 @@ class BackupTab(QWidget):
         lay.addWidget(self.state)
         lay.addWidget(self.bar)
         lay.addWidget(box)
-        note = QLabel("Each folder is mirrored one-way within seconds of a change: changed files become new "
-                      "versions in Drive, deleted ones go to the Drive trash (kept 30 days). A folder that "
-                      "disappears or becomes empty is never mirrored.")
+        note = QLabel("Each folder is kept in sync both ways within seconds of a change, and all its files "
+                      "stay on this computer. Moves and renames stay moves and renames; changed files become "
+                      "new versions in Drive; files added in Drive (from your phone, say) come down here; "
+                      "deletions go to the Drive trash or your local trash. A folder that disappears or "
+                      "becomes empty is never synced.")
         note.setWordWrap(True)
         note.setStyleSheet("color: palette(placeholder-text);")
         lay.addWidget(note)

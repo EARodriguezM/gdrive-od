@@ -1,11 +1,11 @@
-"""Sections (My Drive / Shared with me / Shared drives / Computers), shared-content rules, backups."""
+"""Sections (My Drive / Shared with me / Shared drives / Computers), shared-content rules
+(backed-up folders: test_backup.py)."""
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
-import threading
 from dataclasses import replace
 
 import pytest
@@ -178,65 +178,6 @@ def test_newly_shared_items_list_the_top_level(tmp_path):
     assert eng.dirs_for_changes([ch(parents=["mine"], ownedByMe=True)], None) == set()
     dc = GD.DriveChanges(acc, "gd,shared_with_me=true", {"type": "drive", "shared_with_me": "true"})
     assert dc.root_id() is None
-
-
-# ── backups ──────────────────────────────────────────────────────────────────
-@pytest.fixture
-def backup(env, tmp_path):
-    src = tmp_path / "Documents"
-    (src / "sub").mkdir(parents=True)
-    (src / "a.txt").write_text("a")
-    (src / "sub/b.txt").write_text("b")
-    env.acc = replace(env.acc, backup=[str(src)], backup_name="pc1")
-    return env, src, env.remote / "Computers/pc1/Documents"
-
-
-def test_backup_mirrors_and_follows_changes(backup):
-    env, src, dst = backup
-    (src / "keep.txt").write_text("k")                            # the folder never becomes empty here
-    job = GD.BackupJob(env.acc)
-    assert job.sync(src, "", True)
-    assert (dst / "a.txt").read_text() == "a" and (dst / "sub/b.txt").read_text() == "b"
-    (src / "sub/c.txt").write_text("c")
-    (src / "a.txt").unlink()
-    todo = job.targets(src, {"sub/c.txt": (True, False), "a.txt": (True, False)})
-    assert todo == [("", False), ("sub", False)]                   # one level each, not the whole tree
-    for rel, deep in todo:
-        assert job.sync(src, rel, deep)
-    assert (dst / "sub/c.txt").read_text() == "c" and not (dst / "a.txt").exists()
-    shutil.rmtree(src / "sub")
-    todo = job.targets(src, {"sub": (True, True), "sub/c.txt": (True, False)})
-    assert todo == [("", True)]
-    assert job.sync(src, "", True) and not (dst / "sub/c.txt").exists()
-
-
-def test_backup_never_mirrors_an_emptied_or_missing_source(backup):
-    env, src, dst = backup
-    job = GD.BackupJob(env.acc)
-    assert job.sync(src, "", True)
-    (src / "a.txt").unlink()
-    (src / "sub/b.txt").unlink()
-    assert job.sync(src, "", True) is False and (dst / "a.txt").exists()
-    shutil.rmtree(src)
-    assert job.sync(src, "", True) is False and (dst / "sub/b.txt").exists()
-
-
-def test_backup_job_runs_live(backup):
-    env, src, dst = backup
-    job = GD.BackupJob(env.acc)
-    job.QUIET = 0.3
-    t = threading.Thread(target=job.run, daemon=True)
-    t.start()
-    try:
-        wait_for(lambda: (dst / "sub/b.txt").exists(), 15, "first backup")
-        (src / "new.txt").write_text("n")
-        wait_for(lambda: (dst / "new.txt").exists(), 15, "new file backed up")
-        (src / "sub/b.txt").unlink()
-        wait_for(lambda: not (dst / "sub/b.txt").exists(), 15, "deletion mirrored")
-    finally:
-        job.stop()
-        t.join(15)
-    assert not t.is_alive()
 
 
 # ── the daemon process with sections and a backup ────────────────────────────

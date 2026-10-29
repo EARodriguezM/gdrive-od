@@ -45,21 +45,22 @@ def test_backup_publishes_progress_and_pauses(env, tmp_path):
     acc = replace(env.acc, backup=[str(src)], backup_name="pc1")
     board = GD.StatusBoard(acc)
     GD.backup_pause_flag("t").touch()                              # paused before it starts
-    job = GD.BackupJob(acc, board=board)
-    t = threading.Thread(target=job.run, daemon=True)
+    d = GD.Daemon(GD.backup_roots(acc)[0], changes=None, board=board)
+    t = threading.Thread(target=d.run, daemon=True)
     t.start()
     try:
         wait_for(lambda: (board.data["backup"] or {}).get("state") == "paused", 10, "paused")
         assert not (env.remote / "Computers").exists()
         GD.backup_pause_flag("t").unlink()                         # what `gdrive-od backup resume` does
-        job.request_full()
+        d.wake.set()
         wait_for(lambda: (env.remote / "Computers/pc1/Pics/p2.jpg").exists(), 15, "backup after resume")
         wait_for(lambda: board.data["backup"].get("state") == "idle", 10, "idle again")
         kinds = [e["kind"] for e in board.data["activity"]]
-        assert kinds.count("backup: new") == 3
+        assert kinds.count("upload") == 3
         assert board.data["backup"]["sources"] == [{"path": str(src), "files": 3, "dest": "My Drive/Computers/pc1/Pics"}]
+        assert board.data["backup"]["last_full"] and board.data["backup"]["progress"] is None
     finally:
-        job.stop()
+        d.stop()
         t.join(15)
 
 

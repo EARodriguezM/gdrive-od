@@ -32,6 +32,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import ctypes
 import ctypes.util
 import datetime as dt
@@ -217,8 +218,9 @@ def config_set(account: str, key: str, value=None):
 # With `sections = true` an account folder looks like the Drive website. Each section except
 # Computers is its own sync root with its own DB, lock and change feed; My Drive keeps the
 # account's original DB. Computers: Google lets only its "Drive for desktop" app create entries
-# there, so this PC's backups go to My Drive/Computers/<name>/ (left out of the My Drive sync) and
-# the local Computers folder holds links to the backed-up folders.
+# there, so this PC's backups go to My Drive/Computers/<name>/ (left out of the My Drive sync; each
+# backed-up folder is a sync root of its own, see backup_roots) and the local Computers folder
+# holds links to the backed-up folders.
 MY_DRIVE, SHARED, DRIVES, COMPUTERS = "My Drive", "Shared with me", "Shared drives", "Computers"
 SECTION_ICONS = {MY_DRIVE: "folder-gdrive", SHARED: "folder-publicshare", DRIVES: "folder-network",
                  COMPUTERS: "computer"}
@@ -283,9 +285,41 @@ def sync_roots(acc: Account, refresh: bool = False) -> list[Account]:
     return roots
 
 
+def backup_roots(acc: Account) -> list[Account]:
+    """This PC's backed-up folders, each a two-way sync root of its own: <folder> <->
+    My Drive/Computers/<backup_name>/<folder name>. Every file stays on this computer (no
+    placeholders); what you add, move, rename or delete on either side happens on the other."""
+    host = acc.backup_name or socket.gethostname()
+    roots = []
+    for s in acc.backup:
+        src = Path(os.path.realpath(os.path.expanduser(s)))
+        rel = f"{BACKUP_ROOT}/{host}/{src.name}"
+        roots.append(replace(acc, name=f"{acc.name}.backup-{host}-{src.name}", remote=acc.rpath(rel), local=src,
+                             section="backup", owner=acc.name, label=f"{acc.name} › backup of {src.name}",
+                             ref=rel, backup=[], exclude=[]))
+    return roots
+
+
+def forget_old_backups(acc: Account):
+    """A folder no longer backed up (or backed up under another computer name) loses its sync
+    state: backed up again later, it starts over like a first backup, which deletes nothing on
+    either side, instead of from a state that is long out of date."""
+    keep = {r.db_path for r in backup_roots(acc)}
+    for db in STATE_DIR.glob(f"{acc.name}.backup-*.db"):
+        if db not in keep:
+            db.unlink(missing_ok=True)
+            db.with_suffix(".lock").unlink(missing_ok=True)
+            log.info("%s: forgot the sync state of a folder no longer backed up (%s)", acc.name, db.name)
+
+
+def account_roots(acc: Account, refresh: bool = False) -> list[Account]:
+    """Everything the account's daemon syncs: its sections and its backed-up folders."""
+    return sync_roots(acc, refresh) + backup_roots(acc)
+
+
 def all_roots(accs: dict[str, Account]) -> list[Account]:
     """Every sync root, deepest folder first (so a Shared drive wins over its account folder)."""
-    return sorted((r for a in accs.values() for r in sync_roots(a)), key=lambda r: -len(r.local.parts))
+    return sorted((r for a in accs.values() for r in account_roots(a)), key=lambda r: -len(r.local.parts))
 
 
 def migrate_to_sections(acc: Account):
@@ -378,6 +412,13 @@ def join(a: str, b: str) -> str:
 
 def parent(p: str) -> str:
     return p.rsplit("/", 1)[0] if "/" in p else ""
+
+
+def ancestors(p: str):
+    """The folders a path is in, innermost first ("a/b/c" -> "a/b", "a"; not the root "")."""
+    while "/" in p:
+        p = parent(p)
+        yield p
 
 
 def under(p: str, prefix: str) -> bool:
@@ -671,6 +712,9 @@ def parse_ritem(e: dict) -> RItem | None:
 # ───────────────────────────── engine ─────────────────────────────
 class Engine:
     MAX_SCOPE = 64      # folders listed by one targeted sync; beyond that a full sync is cheaper
+    BULK = 8            # new local files in one sync from which they go up in one rclone run
+    BULK_CHUNK = 500    # files per such run (a pause or shutdown waits for the current one)
+    MKDIR_THREADS = 8   # new folders created at once (those of one depth: their parents exist)
 
     def __init__(self, acc: Account, db: DB, S: dict[str, Row] | None = None):
         self.acc, self.db = acc, db
@@ -680,6 +724,9 @@ class Engine:
         self.deferred: dict[str, float] = {}    # files skipped while still being written -> seconds left
         self.cancelled = lambda: False          # set by the daemon: stop between steps on shutdown
         self.on_event = lambda kind, path: None # set by the daemon: activity for gdrive-od-ui
+        self.on_progress = lambda done, total: None     # set by the daemon: files done in this sync
+        self.backup = acc.section == "backup"   # a backed-up folder of this PC: every file stays local
+        self.seeding = False                    # a backup's first full sync (see adopt_or_conflict)
         try:                                    # path -> version Drive refused ([size, mtime] or ["dir"])
             self.denied: dict[str, list] = json.loads(db.get_meta("denied") or "{}")
         except ValueError:
@@ -695,12 +742,18 @@ class Engine:
         return self.acc.local / (p + STUB_EXT)
 
     def pinned(self, p: str) -> bool:
-        return any(under(p, pin) for pin in self.pins)
+        return self.backup or any(under(p, pin) for pin in self.pins)
+
+    def tag(self, fp: Path, tag: str):
+        if not (self.backup and tag == TAG_OFFLINE):     # backed-up folders: everything is offline anyway
+            set_status_tag(fp, tag)
 
     # ── remote / local listings
-    def list_remote(self, sub: str = "", recursive: bool = True) -> dict[str, RItem]:
-        """Remote entries below folder `sub`: all levels, or only its direct children."""
-        flags = ["-R", "--fast-list"] if recursive else []
+    def list_remote(self, sub: str = "", recursive: bool = True, files_from: str = "") -> dict[str, RItem]:
+        """Remote entries below folder `sub`: all levels, or only its direct children, or only the
+        files listed in the file `files_from` and the folders on their way."""
+        flags = (["-R", "--files-from-raw", files_from] if files_from else      # only the folders on the way
+                 ["-R", "--fast-list"] if recursive else [])
         out = rclone(self.acc, "lsjson", *flags, *LIST_FLAGS, self.acc.rpath(sub))
         items = {}
         for e in json.loads(out or "[]"):
@@ -883,7 +936,8 @@ class Engine:
         if st and stat.S_ISDIR(st.st_mode):
             return ("same" if row and row.kind == "dir" else "changed"), 0.0
         if st and stat.S_ISREG(st.st_mode):
-            if fp.suffix in LINK_EXTS and (lid := self._link_id(fp, st)) is not None:
+            if fp.suffix in LINK_EXTS and not (row and row.state == "local") \
+                    and (lid := self._link_id(fp, st)) is not None:
                 return ("same" if row and row.state == "gdoc" and lid == row.rid else "changed"), 0.0
             if row and row.state == "local" and st.st_size == row.lsize and abs(st.st_mtime - row.lmtime) <= 1e-3:
                 return ("changed" if lstat_or_none(sp) else "same"), 0.0
@@ -969,7 +1023,7 @@ class Engine:
         setx(fp, "user.gdrive.id", r.id)
         setx(fp, "user.gdrive.path", p)
         setx(fp, "user.xdg.comment", f"☁ Online only · {human(r.size)}")
-        set_status_tag(fp, TAG_ONLINE)
+        self.tag(fp, TAG_ONLINE)
         self.S[p] = Row(p, "file", "cloud", r.id, r.size, r.mtime, r.hash, 0, 0.0, r.rname)
 
     def write_link(self, p: str, r: RItem):
@@ -982,7 +1036,7 @@ class Engine:
             os.utime(fp, (t, t))
         setx(fp, "user.gdrive.id", r.id)
         setx(fp, "user.xdg.comment", f"Google {r.gtype or 'file'} · opens in browser")
-        set_status_tag(fp, TAG_GOOGLE)
+        self.tag(fp, TAG_GOOGLE)
         self.S[p] = Row(p, "gdoc", "gdoc", r.id, 0, r.mtime, "", 0, 0.0, r.rname)
 
     def download(self, p: str, r: RItem):
@@ -997,7 +1051,7 @@ class Engine:
         self.stub_path(p).unlink(missing_ok=True)
         st = final.stat()
         self.S[p] = Row(p, "file", "local", r.id, r.size, r.mtime, r.hash, st.st_size, st.st_mtime, r.rname)
-        set_status_tag(final, TAG_OFFLINE)
+        self.tag(final, TAG_OFFLINE)
         log.info("↓ %s", p)
         self.on_event("download", p)
 
@@ -1016,10 +1070,51 @@ class Engine:
             return self.refuse(p, [st.st_size, st.st_mtime], "no permission to upload")
         r = self.stat_remote(p)
         self.S[p] = Row(p, "file", "local", r.id, r.size, r.mtime, r.hash, st.st_size, st.st_mtime, p)
-        set_status_tag(fp, TAG_OFFLINE)
+        self.tag(fp, TAG_OFFLINE)
         self.forget_refusal(p)
         log.info("↑ %s", p)
         self.on_event("upload", p)
+
+    def upload_many(self, paths: list[str], new_dirs: set[str], created: list):
+        """New local files in one `rclone copy` (parallel transfers; it creates the folders in
+        `new_dirs` on the way), then one listing for their Drive IDs. Whatever did not make it
+        is still a new local file for the next sync."""
+        sts = {p: st for p in paths if (st := lstat_or_none(self.real_path(p))) and stat.S_ISREG(st.st_mode)}
+        lst = STATE_DIR / f"{self.acc.name}.upload-list"
+        failed, got = None, {}
+        if sts:
+            try:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                lst.write_text("".join(p + "\n" for p in sts))
+                try:
+                    rclone(self.acc, "copy", str(self.acc.local), self.acc.rpath(), "--files-from-raw", str(lst))
+                except RcloneError as e:
+                    failed = e
+                got = self.list_remote(files_from=str(lst))
+            finally:
+                lst.unlink(missing_ok=True)
+        for d in sorted(new_dirs, key=lambda k: k.count("/")):
+            if d in self.S:
+                continue
+            if d in got and got[d].kind == "dir":
+                self.S[d] = Row(d, "dir", "dir", got[d].id, rname=d)
+            else:
+                self._mkdir_remote(d, created)          # its files did not make it; the folder does
+        for p, st in sts.items():
+            r = got.get(p)
+            if not r or r.kind != "file" or r.size != st.st_size:
+                continue
+            self.S[p] = Row(p, "file", "local", r.id, r.size, r.mtime, r.hash, st.st_size, st.st_mtime, p)
+            self.tag(self.real_path(p), TAG_OFFLINE)
+            self.forget_refusal(p)
+            log.info("↑ %s", p)
+            self.on_event("upload", p)
+        if failed and permission_denied(failed):        # one by one: what Drive refuses is remembered
+            for p in sts:
+                if p not in self.S:
+                    self.upload(p)
+        elif failed:
+            raise failed
 
     def delete_remote(self, p: str, row: Row, r: RItem | None = None):
         if r is not None and not self.owns(r):               # never delete someone else's file
@@ -1085,6 +1180,19 @@ class Engine:
         self.S[p] = Row(p, "dir", "dir", rname=p)
         created.append(p)
 
+    def _mkdir_many(self, paths: list[str], created: list):
+        """New folders whose parents exist, several rclone runs at a time."""
+        failed = 0
+        with concurrent.futures.ThreadPoolExecutor(self.MKDIR_THREADS) as pool:
+            for f in [pool.submit(self._mkdir_remote, p, created) for p in paths]:
+                try:
+                    f.result()
+                except Exception as e:
+                    failed += 1
+                    log.error("%s", e)
+        if failed:
+            raise RuntimeError(f"{failed} of {len(paths)} new folder(s) could not be created in Drive")
+
     def delete_local(self, p: str, fp: Path):
         trash_local(fp, self.acc)
         self.S.pop(p, None)
@@ -1103,9 +1211,17 @@ class Engine:
         self.on_event("conflict", newp)
 
     def adopt_or_conflict(self, p: str, r: RItem, l: LItem):
-        if l.size == r.size and (not r.hash or md5_file(l.fpath) == r.hash):
+        """The same file here and in Drive with no common history. Backed-up folders: the same size
+        and modification time is the same file (their copy in Drive was made from here, so there
+        is no need to read every file); on a root's first sync this computer's version wins (the
+        one in Drive stays in its version history)."""
+        t = parse_time(r.mtime)
+        same_time = self.backup and t is not None and abs(t - l.mtime) <= 1
+        if l.size == r.size and (same_time or not r.hash or md5_file(l.fpath) == r.hash):
             self.S[p] = Row(p, "file", "local", r.id, r.size, r.mtime, r.hash, l.size, l.mtime, r.rname)
-            set_status_tag(l.fpath, TAG_OFFLINE)
+            self.tag(l.fpath, TAG_OFFLINE)
+        elif self.backup and self.seeding:
+            self.upload(p)
         else:
             self.conflict(p, r)
 
@@ -1145,9 +1261,19 @@ class Engine:
         self.dupe_stubs, self.deferred, self.restored, self.refused = [], {}, [], []
         denied_before = dict(self.denied)
         files_in_S = sum(1 for r in S.values() if r.kind != "dir")
+        if self.backup and not acc.local.is_dir():
+            raise RuntimeError(f"{acc.local} is missing — refusing to sync it; its backup in Drive is "
+                               "left as it is.")
+        self.seeding = self.backup and dirs is None and self.db.get_meta("seeded") is None
         if dirs is None:
             scope = Scope(deep={""})
-            R = self.list_remote()
+            try:
+                R = self.list_remote()
+            except RcloneError as e:
+                if not (self.seeding and e.code == DIR_NOT_FOUND and not files_in_S):
+                    raise
+                rclone(acc, "mkdir", acc.rpath())       # a new backup: its folder in Drive
+                R = {}
             L, Ldirs, _ = self.scan_local()
             if not R and files_in_S and not force:
                 raise RuntimeError("Remote listing is empty but files were synced before — refusing "
@@ -1188,6 +1314,7 @@ class Engine:
             return False
 
         early, acts, late, created = [], [], [], []
+        mk_remote, bulk = [], []                # new local folders; new local files (see upload_many)
         n_del_remote = n_del_local = 0
 
         # 3. directories
@@ -1203,7 +1330,7 @@ class Engine:
             if p in Sd:      # synced before, deleted remotely
                 late.append((p.count("/"), lambda p=p: self._rmdir_local(p)))
             else:
-                early.append(lambda p=p: self._mkdir_remote(p, created))
+                mk_remote.append(p)
         for p in Rd & Ldirs:
             S[p] = Row(p, "dir", "dir", R[p].id, rname=p)
 
@@ -1214,6 +1341,8 @@ class Engine:
             r = R.get(p) if (R.get(p) and R[p].kind != "dir") else None
             s = S.get(p) if (S.get(p) and S[p].kind != "dir") else None
             l = L.get(p)
+            if l and l.kind == "link" and not ((r and r.kind == "gdoc") or (s and s.kind == "gdoc")):
+                l = replace(l, kind="real")           # a copy of a link file, or one kept as a file in Drive
 
             # Google Docs/Sheets/... : always a small link file
             if (r and r.kind == "gdoc") or (s and s.kind == "gdoc") or (l and l.kind == "link"):
@@ -1263,7 +1392,7 @@ class Engine:
                         elif rc:
                             acts.append(lambda p=p, r=r: self.download(p, r))
                         else:
-                            set_status_tag(l.fpath, TAG_OFFLINE)
+                            self.tag(l.fpath, TAG_OFFLINE)
                     elif l and l.kind == "stub":
                         S[p] = replace(s, state="cloud", lsize=0, lmtime=0.0)
                     elif rc:                          # deleted locally but changed online: restore
@@ -1295,10 +1424,36 @@ class Engine:
                     S.pop(p, None)
             elif l:                                   # new local file
                 if l.kind == "real":
-                    if not settling(l):
+                    if not settling(l) and "\n" not in p and not self.refused_before(p, [l.size, l.mtime]):
+                        bulk.append(p)
+                    elif not settling(l):
                         acts.append(lambda p=p: self.upload(p))
                 else:
                     acts.append(lambda l=l: l.fpath.unlink(missing_ok=True))
+
+        # many new files (a folder copied in, the first backup): one rclone run per chunk, which
+        # also creates the new folders they are in
+        weight: dict = {}                             # step -> files it handles
+        skip: set[str] = set()                        # new folders the bulk upload creates
+        if len(bulk) >= self.BULK and acc.section != "shared":
+            skip = set(mk_remote) & {a for p in bulk for a in ancestors(p)}
+            for i in range(0, len(bulk), self.BULK_CHUNK):
+                chunk = bulk[i:i + self.BULK_CHUNK]
+                dirs_c = skip & {a for p in chunk for a in ancestors(p)}
+                fn = lambda c=chunk, d=dirs_c: self.upload_many(c, d, created)
+                acts.append(fn)
+                weight[fn] = len(chunk)
+        else:
+            acts += [lambda p=p: self.upload(p) for p in bulk]
+        mk_remote = [p for p in mk_remote if p not in skip]
+        if len(mk_remote) >= self.BULK:              # e.g. empty folders a one-way mirror never had
+            for depth in sorted({p.count("/") for p in mk_remote}):
+                level = [p for p in mk_remote if p.count("/") == depth]
+                fn = lambda ps=level: self._mkdir_many(ps, created)
+                early.append(fn)
+                weight[fn] = len(level)
+        else:
+            early += [lambda p=p: self._mkdir_remote(p, created) for p in mk_remote]
 
         cap = max(25, files_in_S * acc.max_delete_pct // 100)
         if not force and (n_del_remote > cap or n_del_local > cap):
@@ -1306,22 +1461,28 @@ class Engine:
                                f"{n_del_local} locally (limit {cap}). Check the folder, then run "
                                f"'gdrive-od sync --force {acc.name}' if intended.")
 
-        errors = 0
+        errors, stopped = 0, False
         steps = early + acts + [f for _, f in sorted(late, key=lambda x: -x[0])]
+        total, done = sum(weight.get(f, 1) for f in steps), 0
         for i, fn in enumerate(steps):
             if self.cancelled():
                 log.info("stopping: %d step(s) left for the next sync", len(steps) - i)
+                stopped = True
                 break
+            self.on_progress(done, total)
             try:
                 fn()
             except Exception as e:
                 errors += 1
                 log.error("%s", e)
+            done += weight.get(fn, 1)
         if created:
             self._fill_dir_ids(created)
         self.db.save(S)
         if self.denied != denied_before:
             self.db.set_meta("denied", json.dumps(self.denied))
+        if self.seeding and not errors and not stopped:
+            self.db.set_meta("seeded", str(time.time()))
         if errors:
             notify("Google Drive", f"{acc.title}: {errors} item(s) failed to sync; see "
                                    f"'journalctl --user -u gdrive-od@{acc.owner or acc.name}'")
@@ -1337,16 +1498,18 @@ class Engine:
             log.info("targeted sync done for %s: %d step(s), %d errors", acc.title, len(steps), errors)
 
     def _fill_dir_ids(self, created: list[str]):
-        """Folders we just created online: record their Drive IDs (needed to map Drive changes)."""
-        for up in sorted({parent(p) for p in created}):
+        """Folders we just created online: record their Drive IDs (needed to map Drive changes).
+        Many of them: one recursive listing (a listing per deep folder costs an API call per level)."""
+        ups = sorted({parent(p) for p in created})
+        listing: dict[str, RItem] = {}
+        for up in ups if len(ups) < self.BULK else [""]:
             try:
-                listing = self.list_remote(up, recursive=False)
+                listing.update(self.list_remote(up, recursive=len(ups) >= self.BULK))
             except RuntimeError as e:
                 log.debug("cannot list %s: %s", up or "/", e)
-                continue
-            for p in created:
-                if parent(p) == up and p in self.S and p in listing and listing[p].id:
-                    self.S[p] = replace(self.S[p], rid=listing[p].id)
+        for p in created:
+            if p in self.S and p in listing and listing[p].id:
+                self.S[p] = replace(self.S[p], rid=listing[p].id)
 
     def _rmdir_local(self, p: str):
         try:
@@ -1912,13 +2075,29 @@ class StatusBoard:
 
     def root(self, name: str, **fields):
         with self.lock:
-            self.data["roots"].setdefault(name, {}).update(fields)
+            r = self.data["roots"].setdefault(name, {})
+            r.update(fields)
+            if r.get("section") == "backup":
+                self.data["backup"] = self._backup_summary()
         self.changed.set()
 
-    def backup(self, **fields):
-        with self.lock:
-            self.data["backup"] = {**(self.data["backup"] or {}), **fields}
-        self.changed.set()
+    def _backup_summary(self) -> dict:
+        """The backed-up folders (each a sync root) as one backup, the way the app shows it."""
+        bs = [r for r in self.data["roots"].values() if r.get("section") == "backup"]
+        busy = next((r for r in bs if r.get("state") in ("syncing", "starting")), None)
+        err = next((r for r in bs if r.get("state") == "error"), None)
+        state = ("error" if err else "running" if busy else
+                 "paused" if all(r.get("state") == "paused" for r in bs) else "idle")
+        fulls = [r.get("last_full") for r in bs]
+        return {"state": state, "current": os.path.basename(busy.get("local", "")) if busy else "",
+                "progress": busy.get("progress") if busy else None,
+                "error": err.get("error", "") if err else "", "error_time": err.get("error_time") if err else None,
+                "last_full": min(fulls) if fulls and all(fulls) else None,
+                "next_full": min((r["next_full"] for r in bs if r.get("next_full")), default=None),
+                "last_run": max((r["last_sync"] for r in bs if r.get("last_sync")), default=None),
+                "sources": [{"path": r.get("local"), "dest": r.get("dest"),
+                             "files": sum(v for k, v in (r.get("counts") or {}).items() if k != "dir") if r.get("counts")
+                             else None} for r in bs]}
 
     def account(self, **fields):
         with self.lock:
@@ -1975,7 +2154,8 @@ class Daemon:
     """Live sync for one account. Local changes arrive through inotify, Drive changes through the
     Changes API. Both become targeted syncs of the affected folders. A full sync runs at start,
     every full_sync_interval (every `interval` when live detection is unavailable), on SIGUSR1,
-    and after an inotify queue overflow."""
+    and after an inotify queue overflow. A backed-up folder (section "backup") also stops while
+    the account's backup is paused; local and Drive changes wait and a full sync follows the resume."""
     QUIET = 2.0             # seconds without new events before a local change is synced
 
     def __init__(self, acc: Account, changes="auto", board=NO_BOARD):
@@ -2007,6 +2187,9 @@ class Daemon:
         self._stop.set()
         self.wake.set()
 
+    def paused(self) -> bool:
+        return self.acc.section == "backup" and backup_pause_flag(self.acc.owner or self.acc.name).exists()
+
     # ── main loop
     def run(self):
         acc = self.acc
@@ -2019,11 +2202,23 @@ class Daemon:
                  f"every {acc.poll_interval:g}s (Changes API)" if self.changes else f"every {acc.interval}s")
         self.board.root(acc.name, title=acc.title, section=acc.section or "my-drive", local=str(acc.local),
                         state="starting", feed="live" if self.changes else "off",
-                        watch="live" if self.watcher else "off")
+                        watch="live" if self.watcher else "off",
+                        **({"dest": f"My Drive/{acc.ref}"} if acc.section == "backup" else {}))
         next_full = next_poll = 0.0
+        was_paused = False
         try:
             while not self._stop.is_set():
                 self.wake.clear()
+                if self.paused():
+                    if not was_paused:
+                        log.info("%s: paused", acc.title)
+                        self.board.root(acc.name, state="paused", progress=None)
+                    was_paused = True
+                    self.wake.wait(3600)
+                    continue
+                if was_paused:
+                    log.info("%s: resumed", acc.title)
+                    was_paused, self.full_requested = False, True
                 now = time.monotonic()
                 if self.watcher and self.watcher.take_overflow():
                     log.warning("inotify: event queue overflow or watch lost; running a full sync")
@@ -2069,7 +2264,8 @@ class Daemon:
             self.watcher.close()
             self.watcher = None
         try:
-            self.acc.local.mkdir(parents=True, exist_ok=True)
+            if self.acc.section != "backup":            # a backed-up folder is never made up
+                self.acc.local.mkdir(parents=True, exist_ok=True)
             self.watcher = Watcher(self.acc.local, self.wake)
             log.info("watching %d folders under %s", len(self.watcher.wd2dir), self.acc.local)
         except OSError as e:
@@ -2078,14 +2274,16 @@ class Daemon:
     def _engine(self) -> Engine:
         if self.db.changed() or self.eng is None:   # a CLI pin/unpin/sync changed the DB
             self.eng = Engine(self.acc, self.db)
-            self.eng.cancelled = self._stop.is_set
+            self.eng.cancelled = lambda: self._stop.is_set() or self.paused()
             self.eng.on_event = lambda kind, path: self.board.event(self.acc.title, kind, path)
+            self.eng.on_progress = lambda done, total: self.board.root(
+                self.acc.name, progress={"transfers": done, "totalTransfers": total} if total > 1 else None)
         return self.eng
 
     def _synced(self, eng: Engine, full: bool):
         now = time.time()
         self.board.account(attention="")
-        self.board.root(self.acc.name, state="idle", error="", last_sync=now, counts=file_counts(eng.S),
+        self.board.root(self.acc.name, state="idle", error="", progress=None, last_sync=now, counts=file_counts(eng.S),
                         watch="live" if self.watcher and self.watcher.healthy() else "limited" if self.watcher else "off",
                         **({"last_full": now} if full else {}))
 
@@ -2206,8 +2404,8 @@ class Daemon:
         self.fails += 1
         self.retry_at = time.monotonic() + min(self.acc.interval, 10 * 2 ** min(self.fails, 5))
         log.error("sync failed: %s", e)
-        self.board.root(self.acc.name, state="error", error=str(e)[-300:], error_time=time.time())
-        if "Safety stop" in str(e):
+        self.board.root(self.acc.name, state="error", error=str(e)[-300:], error_time=time.time(), progress=None)
+        if "Safety stop" in str(e) or "refusing" in str(e):
             notify("Google Drive — sync paused", str(e))
         elif sign_in_expired(e):
             notify_reconnect(self.acc)
@@ -2262,183 +2460,6 @@ class Daemon:
         self.fails = 0
 
 
-# ───────────────────────────── backups ─────────────────────────────
-class BackupJob:
-    """This PC's folders -> My Drive/Computers/<name>/<folder>: a one-way mirror (rclone sync).
-    Changed files become new revisions, removed ones go to the Drive trash. inotify starts a sync
-    of just the changed folder within seconds; a full pass runs at start and every
-    full_sync_interval. A source that vanished or became empty is never mirrored."""
-    QUIET = 5.0
-    EXCLUDES = (".~lock.*#", "~$*", "*.part", "*.crdownload", "*.kate-swp", "*.swp", "*.swx", f"*{TMP_EXT}",
-                ".Trash-*/**")
-
-    def __init__(self, acc: Account, board=NO_BOARD):
-        self.acc = acc
-        self.board = board
-        self.proc: subprocess.Popen | None = None
-        self.title = f"{acc.name} › backup"
-        self.host = acc.backup_name or socket.gethostname()
-        self.sources = [Path(os.path.realpath(os.path.expanduser(s))) for s in acc.backup]
-        self.wake, self._stop = threading.Event(), threading.Event()
-        self.full_requested = True
-        self.watchers: dict[Path, Watcher] = {}
-        self.state_path = STATE_DIR / f"{acc.name}.backup.json"
-        try:
-            self.counts: dict[str, int] = json.loads(self.state_path.read_text())   # files per source
-        except (OSError, ValueError):
-            self.counts = {}
-
-    def request_full(self):
-        self.full_requested = True
-        self.wake.set()
-
-    def stop(self):
-        self._stop.set()
-        self.wake.set()
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-
-    def paused(self) -> bool:
-        return backup_pause_flag(self.acc.name).exists()
-
-    def publish(self, **fields):
-        self.board.backup(sources=[{"path": str(s), "files": self.counts.get(str(s)),
-                                    "dest": f"My Drive/{BACKUP_ROOT}/{self.host}/{s.name}"} for s in self.sources],
-                          **fields)
-
-    def dest(self, src: Path, rel: str = "") -> str:
-        base = f"{BACKUP_ROOT}/{self.host}/{src.name}"
-        return self.acc.rpath(join(base, rel) if rel else base)
-
-    def run(self):
-        for src in self.sources:
-            if src.is_dir():
-                try:
-                    self.watchers[src] = Watcher(src, self.wake)
-                except OSError as e:
-                    log.warning("backup: cannot watch %s (%s); it is backed up every %ss", src, e,
-                                self.acc.full_sync_interval)
-        log.info("backup of %s to %s", ", ".join(map(str, self.sources)), self.dest(Path("…")).rsplit("/", 1)[0])
-        self.publish(state="paused" if self.paused() else "starting", progress=None)
-        next_full = 0.0
-        try:
-            while not self._stop.is_set():
-                self.wake.clear()
-                if any(w.take_overflow() for w in self.watchers.values()):
-                    self.full_requested = True
-                if self.paused():                        # changes keep queueing in the watchers
-                    self.publish(state="paused", progress=None)
-                    self.wake.wait(3600)
-                    continue
-                if self.full_requested or time.monotonic() >= next_full:
-                    self.full_requested = False
-                    ok = all([self.sync(src, "", True) for src in self.sources])
-                    next_full = time.monotonic() + (self.acc.full_sync_interval if ok else self.acc.interval)
-                    if ok:
-                        self.publish(state="idle", progress=None, last_full=time.time(),
-                                     next_full=time.time() + next_full - time.monotonic())
-                else:
-                    for src, w in self.watchers.items():
-                        for rel, recursive in self.targets(src, w.take_entries(self.QUIET)):
-                            if self._stop.is_set():
-                                break
-                            self.sync(src, rel, recursive)
-                due = [t for t in (w.next_ready(self.QUIET) for w in self.watchers.values()) if t is not None]
-                self.wake.wait(0 if self.full_requested else
-                               min(max(min([next_full, *due]) - time.monotonic(), 0.05), 3600))
-        finally:
-            for w in self.watchers.values():
-                w.close()
-
-    @staticmethod
-    def targets(src: Path, events: dict[str, tuple[bool, bool]]) -> list[tuple[str, bool]]:
-        """What to mirror for these changed paths: a changed file -> its folder (one level); a new
-        folder -> that folder (whole); something deleted -> its folder (whole if it was a folder)."""
-        out: set[tuple[str, bool]] = set()
-        for rel, (_, was_dir) in events.items():
-            fp = src / rel
-            if fp.is_dir() and not fp.is_symlink():
-                out.add((rel, True))
-            elif fp.exists() or fp.is_symlink():
-                out.add((parent(rel), False))
-            else:
-                out.add((parent(rel), was_dir))
-        deep = {r for r, d in out if d}
-        return sorted((r, d) for r, d in out
-                      if not any(x != r and under(r, x) for x in deep) and (d or r not in deep))
-
-    def sync(self, src: Path, rel: str, recursive: bool) -> bool:
-        if not src.is_dir():
-            notify("Google Drive — backup paused", f"{src} is missing; its backup in Drive is left as it is.")
-            self.publish(state="error", error=f"{src} is missing", error_time=time.time())
-            return False
-        if not rel:                                     # full pass: guard against a vanished/empty source
-            n = sum(len(files) for _, _, files in os.walk(src))
-            if n == 0 and self.counts.get(str(src), 0) > 0:
-                notify("Google Drive — backup paused", f"{src} is empty now; its backup in Drive is left as it is.")
-                self.publish(state="error", error=f"{src} is empty", error_time=time.time())
-                return False
-            self.counts[str(src)] = n
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(json.dumps(self.counts))
-        while rel and not (src / rel).is_dir():          # deleted folder: mirror the closest one left
-            rel, recursive = parent(rel), True
-        cap = max(25, self.counts.get(str(src), 0) // 2)
-        args = [RCLONE, "sync", str(src / rel) if rel else str(src), self.dest(src, rel),
-                "--max-delete", str(cap), "--skip-links", "-v", "--use-json-log", "--stats", "2s",
-                *(["--fast-list", "--track-renames"] if recursive else ["--max-depth", "1"]),
-                *(a for x in self.EXCLUDES for a in ("--exclude", x)), *BASE_FLAGS, *self.acc.rclone_args]
-        t = time.monotonic()
-        where = f"{src.name}/{rel}" if rel else src.name
-        new = upd = gone = moved = 0
-        errors: list[str] = []
-        self.publish(state="running", current=where, progress=None)
-        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                                     stdin=subprocess.DEVNULL)
-        for line in self.proc.stderr:
-            try:
-                d = json.loads(line)
-            except ValueError:
-                errors.append(line.strip())
-                continue
-            if "stats" in d:
-                st = d["stats"]
-                self.publish(state="running", current=where, progress={
-                    k: st.get(k) for k in ("bytes", "totalBytes", "transfers", "totalTransfers", "checks",
-                                           "totalChecks", "speed", "eta", "errors", "deletes")})
-            msg, obj = d.get("msg", ""), d.get("object") or ""
-            kind = ("new" if msg.startswith("Copied (new)") else "updated" if msg.startswith("Copied (") else
-                    "moved" if msg.startswith("Moved") else "removed" if msg.startswith("Deleted") else "")
-            if kind:
-                new, upd, moved, gone = new + (kind == "new"), upd + (kind == "updated"), \
-                    moved + (kind == "moved"), gone + (kind == "removed")
-                self.board.event(self.title, f"backup: {kind}", join(where, obj) if obj else where)
-            elif d.get("level") in ("error", "critical"):
-                errors.append(msg)
-            if self.paused() or self._stop.is_set():          # stop now; the next run picks up from here
-                self.proc.terminate()
-        rc = self.proc.wait()
-        if self.paused() or self._stop.is_set():
-            self.publish(state="paused" if self.paused() else "stopped", progress=None)
-            return False
-        if rc:
-            err = " / ".join(errors)[-400:] or f"rclone exited with {rc}"
-            if "max-delete" in err.lower() or "max delete" in err.lower():
-                notify("Google Drive — backup paused", f"Backing up {where} would delete more than {cap} files "
-                                                       "in Drive; nothing was deleted. Check the folder.")
-            elif sign_in_expired(RuntimeError(err)):
-                notify_reconnect(self.acc)
-                self.board.account(attention="sign-in expired")
-            log.error("backup of %s failed: %s", where, err)
-            self.publish(state="error", error=err, error_time=time.time(), progress=None)
-            return False
-        if new or upd or gone or moved or not rel:
-            log.info("backup of %s: %d new, %d updated, %d moved, %d removed (%.0fs)",
-                     where, new, upd, moved, gone, time.monotonic() - t)
-        self.publish(state="idle", error="", current="", progress=None, last_run=time.time())
-        return True
-
-
 # ───────────────────────────── CLI ─────────────────────────────
 def resolve(accs: dict[str, Account], path: str) -> tuple[Account, str]:
     """The sync root a path belongs to (a section of an account, or the account) and the path in it."""
@@ -2478,7 +2499,7 @@ def cmd_sync(accs, args):
     for n in args.accounts or list(accs):
         acc = accs.get(n) or die(f"unknown account {n}")
         prepare_layout(acc)
-        for root in sync_roots(acc, refresh=True):
+        for root in account_roots(acc, refresh=True):
             try:
                 with Locked(root):
                     Engine(root, DB(root.db_path)).sync(force=args.force)
@@ -2700,24 +2721,23 @@ def cmd_backup(accs, args):
 
 def cmd_daemon(accs, args):
     """One process per account: a Daemon thread per sync root (My Drive, Shared with me, each
-    Shared drive) and the backup job. SIGUSR1 = full sync of everything; Shared drives you join
-    later are picked up hourly and on SIGUSR1."""
+    Shared drive, each backed-up folder). SIGUSR1 = full sync of everything; SIGUSR2 = the backup
+    was paused or resumed; Shared drives you join later are picked up hourly and on SIGUSR1."""
     acc = accs.get(args.account) or die(f"unknown account {args.account}")
     prepare_layout(acc)
+    forget_old_backups(acc)
     board = StatusBoard(acc)
     workers: dict[str, object] = {}
     threads: list[threading.Thread] = []
 
     def start(key: str, w):
         workers[key] = w
-        t = threading.Thread(target=w.run, name=w.title if isinstance(w, BackupJob) else w.acc.title, daemon=True)
+        t = threading.Thread(target=w.run, name=w.acc.title, daemon=True)
         t.start()
         threads.append(t)
 
-    for root in sync_roots(acc, refresh=True):
+    for root in account_roots(acc, refresh=True):
         start(root.name, Daemon(root, board=board))
-    if acc.backup:
-        start("backup", BackupJob(acc, board=board))
     stop, refresh = threading.Event(), threading.Event()
     threading.Thread(target=board.run, args=(stop,), name="status", daemon=True).start()
 
@@ -2727,9 +2747,9 @@ def cmd_daemon(accs, args):
             w.request_full()
 
     def on_usr2(*_):                    # backup paused/resumed (gdrive-od backup pause|resume)
-        job = workers.get("backup")
-        if job:
-            job.wake.set() if job.paused() else job.request_full()
+        for w in workers.values():
+            if w.acc.section == "backup":
+                w.wake.set()            # it sees the flag; a resume brings a full sync
 
     signal.signal(signal.SIGUSR1, on_usr1)
     signal.signal(signal.SIGUSR2, on_usr2)
@@ -2793,6 +2813,10 @@ def cmd_pin(accs, args):
 
 def cmd_unpin(accs, args):
     for acc, rels in _group(accs, args.paths):
+        if acc.section == "backup":
+            notify("Google Drive", f"{acc.local.name} is a backed-up folder of this computer: its files "
+                                   "always stay here.")
+            continue
         with Locked(acc):
             db = DB(acc.db_path)
             eng = Engine(acc, db)
@@ -2868,8 +2892,9 @@ def cmd_web(accs, args):
     acc, rel = resolve(accs, args.path)
     row = DB(acc.db_path).load().get(rel)
     if rel == "":
-        url = {"shared": SECTION_URLS[SHARED],
-               "drive": f"https://drive.google.com/drive/folders/{acc.ref}"}.get(acc.section, SECTION_URLS[MY_DRIVE])
+        folder = acc.ref if acc.section == "drive" else DB(acc.db_path).get_meta("root_id") if acc.section == "backup" else ""
+        url = f"https://drive.google.com/drive/folders/{folder}" if folder else \
+            SECTION_URLS[SHARED] if acc.section == "shared" else SECTION_URLS[MY_DRIVE]
     elif not row or not row.rid:
         die("This item has not been synced to Drive yet.")
     elif row.kind == "dir":
@@ -2918,7 +2943,7 @@ CONFIG_HEADER = """\
 #   sections = true                     My Drive / Shared with me / Shared drives / Computers
 #   shared_with_me     = true
 #   shared_drives      = "all"          or ["Drive name", ...], or [] for none
-#   backup             = ["~/Documents"]   this PC -> My Drive/Computers/<host>/ (one-way mirror)
+#   backup             = ["~/Documents"]   this PC <-> My Drive/Computers/<host>/ (two-way, all files kept here)
 #   backup_name        = "my-laptop"    the <host> folder name (default: this computer's name)
 #   poll_interval      = 15             seconds between Drive change checks
 #   full_sync_interval = 1800           full reconciliation (safety net) while live sync works
