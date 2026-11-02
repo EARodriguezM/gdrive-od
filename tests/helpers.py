@@ -133,6 +133,53 @@ class FakeFeed:
     def removed(self, file_id: str):
         self._add({"changeType": "file", "fileId": file_id, "removed": True})
 
+    # the DriveChanges interface used by the engine: files by ID, also in the Drive trash
+    # (fake_rclone.py's deletefile keeps them in tmp/drive-trash/<parent ID>-<n>/<name>)
+    @property
+    def drive_trash(self) -> Path:
+        return self.env.tmp / "drive-trash"
+
+    def find(self, fid: str) -> Path | None:
+        for base in (self.env.remote, self.drive_trash):
+            if base.exists() and ino(base) == fid:
+                return base
+            for dp, dns, fns in os.walk(base):
+                for n in dns + fns:
+                    if ino(Path(dp) / n) == fid:
+                        return Path(dp) / n
+        return None
+
+    def get_file(self, fid: str):
+        fp = self.find(fid)
+        if fp is None:
+            return None
+        trashed = self.drive_trash in fp.parents
+        gdoc = fp.name.endswith(".desktop")
+        f = {"id": fid, "name": fp.name[:-len(".desktop")] if gdoc else fp.name, "trashed": trashed,
+             "ownedByMe": True, "parents": [fp.parent.name.split("-")[0] if trashed else ino(fp.parent)],
+             "modifiedTime": GD.dt.datetime.fromtimestamp(fp.stat().st_mtime, GD.dt.timezone.utc).isoformat()}
+        if fp.is_dir():
+            f["mimeType"] = "application/vnd.google-apps.folder"
+        elif gdoc:
+            f["mimeType"] = "application/vnd.google-apps.document"
+        else:
+            data = fp.read_bytes()
+            f.update(mimeType="text/plain", size=str(len(data)), md5Checksum=hashlib.md5(data).hexdigest())
+        return f
+
+    def move_file(self, fid: str, folder: str, name: str, old_parents: list):
+        fp, dest = self.find(fid), self.find(folder)
+        os.rename(fp, dest / (name + ".desktop" if fp.name.endswith(".desktop") else name))
+        return self.get_file(fid)
+
+    def untrash(self, fid: str):
+        fp = self.find(fid)
+        os.rename(fp, self.find(fp.parent.name.split("-")[0]) / fp.name)
+        return self.get_file(fid)
+
+    def download(self, fid: str, dest: Path):
+        shutil.copy2(self.find(fid), dest)
+
     def _add(self, ch: dict):
         with self.lock:
             self.changes.append(ch)

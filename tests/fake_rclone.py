@@ -6,12 +6,14 @@ remote look more like Google Drive in `lsjson` output:
 `authorize` is answered like the real one (consent link, then the token) with the token in
 $GDOD_FAKE_AUTHORIZE, without any browser round trip. $GDOD_FAKE_OWNER_OTHERS marks items owned
 by someone else (owner metadata); $GDOD_FAKE_DENY makes writes fail like a Drive 403;
-$GDOD_FAKE_ABOUT answers `about`.
+$GDOD_FAKE_ABOUT answers `about`; with $GDOD_FAKE_TRASH, `deletefile` moves the file into that
+folder (like Drive's trash, it keeps its ID).
 Each call is appended as a JSON line to $GDOD_RCLONE_LOG when that is set."""
 import json
 import os
 import subprocess
 import sys
+import time
 
 args = sys.argv[1:]
 if os.environ.get("GDOD_RCLONE_LOG"):
@@ -23,6 +25,13 @@ if deny and args[:1] in (["copyto"], ["deletefile"], ["mkdir"], ["moveto"], ["rm
     sys.stderr.write("ERROR : googleapi: Error 403: The user does not have sufficient permissions "
                      "for this file., insufficientFilePermissions\n")
     sys.exit(1)
+trash = os.environ.get("GDOD_FAKE_TRASH")     # Drive's trash: a deleted file keeps its ID (inode)
+if trash and args[:1] == ["deletefile"] and os.path.isfile(args[1]):
+    # trash/<parent ID>-<n>/<name>: FakeFeed finds it there by ID and knows where it was
+    box = os.path.join(trash, "i%d-%d" % (os.stat(os.path.dirname(args[1])).st_ino, time.time_ns()))
+    os.makedirs(box)
+    os.rename(args[1], os.path.join(box, os.path.basename(args[1])))
+    sys.exit(0)
 if args[:1] == ["about"] and os.environ.get("GDOD_FAKE_ABOUT"):
     print(os.environ["GDOD_FAKE_ABOUT"])
     sys.exit(0)
