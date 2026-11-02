@@ -85,7 +85,8 @@ RCLONE = os.environ.get("GDOD_RCLONE", "rclone")
 # Never prompt for a config password: the daemon has no terminal.
 BASE_FLAGS = ["--drive-export-formats", "desktop", "--ask-password=false"]
 LIST_FLAGS = ["--hash", "--hash-type", "md5", "-M"]
-DIR_NOT_FOUND = 3       # rclone exit code
+DIR_NOT_FOUND = 3       # rclone exit codes
+FILE_NOT_FOUND = 4
 
 log = logging.getLogger("gdrive-od")
 
@@ -731,8 +732,16 @@ class Engine:
             self.denied: dict[str, list] = json.loads(db.get_meta("denied") or "{}")
         except ValueError:
             self.denied = {}
+        try:                                    # path -> ID of a Google file restored for a link there
+            self.revived: dict[str, str] = json.loads(db.get_meta("revived") or "{}")
+        except ValueError:
+            self.revived = {}
+        self.rescued: list[str] = []            # this run: items brought back from the Drive trash
         self.restored: list[str] = []           # this run: deletions undone (not yours / not allowed)
         self.refused: list[str] = []            # this run: local items Drive wouldn't take
+        self.drive = "auto"                     # Drive API by file ID (DriveChanges); None: not available
+        self.siblings: list[Account] = []       # every sync root of every account (set by the daemon/CLI)
+        self._drives: dict[str, object] = {}    # other accounts' Drive APIs
 
     # paths
     def real_path(self, p: str) -> Path:
@@ -1122,6 +1131,10 @@ class Engine:
         try:
             rclone(self.acc, "deletefile", self.acc.rpath(row.rname or p))   # Drive: goes to trash
         except RcloneError as e:
+            if e.code == FILE_NOT_FOUND:                    # gone meanwhile (e.g. brought into another folder)
+                self.S.pop(p, None)
+                log.info("%s: %s is no longer here in Drive", self.acc.title, p)
+                return
             if not permission_denied(e):
                 raise
             return self.restore(p, row, r or row.as_ritem())
@@ -1249,6 +1262,157 @@ class Engine:
         log.info("☁ %s", p)
         return True
 
+    # ── links and placeholders that arrive from another synced folder
+    def _bring_along(self, R: dict[str, RItem], L: dict[str, LItem], scope: Scope, full: bool):
+        """Links and placeholders moved here from another synced folder (My Drive -> a backed-up
+        folder, say). There they look deleted, so that folder's sync puts their Drive item in the
+        trash, where it would be lost: the link was all there was of it on this computer. Instead
+        the item moves to the same place in this folder's Drive folder, out of the trash if need
+        be. A copy (the original is still where it was) is not moved: a placeholder brings its
+        content (fetch), a link is synced as a plain file. Full syncs also look at links synced as
+        plain files, whose Google file may have gone to the trash since (the one-way backup made
+        such copies)."""
+        S = self.S
+        cands = [(p, l) for p, l in L.items()
+                 if l.kind in ("link", "stub") and l.xid and scope.contains(p) and p not in scope.busy
+                 and (p not in S or (full and l.kind == "link" and S[p].kind == "file" and S[p].rid != l.xid))]
+        if not cands:
+            return
+        known = {r.id for r in R.values() if r.id} | {row.rid for row in S.values() if row.rid}
+        for p, l in sorted(cands, key=lambda c: c[0]):
+            s = S.get(p)
+            if l.xid in known or (p in R and not (s and R[p].id == s.rid)):
+                continue            # this folder's own (moved or copied within it), or the place is taken
+            try:
+                self._bring(p, l, R)
+            except Exception as e:
+                log.error("%s: %s came from elsewhere, but its Drive item could not be moved here: %s",
+                          self.acc.title, p, e)
+
+    def _bring(self, p: str, l: LItem, R: dict[str, RItem]):
+        src = self._root_named(self._pointer_account(l))
+        api = self._drive_of(src) if src else None
+        f = api.get_file(l.xid) if api else None
+        if not f:
+            return
+        mime = f.get("mimeType", "")
+        if mime.startswith("application/vnd.google-apps.") != (l.kind == "link") \
+                or mime.endswith((".folder", ".shortcut")):
+            return
+        owner = src.owner or src.name
+        elsewhere = self._still_linked(l.xid, owner)
+        if elsewhere == "yes" or not (f.get("trashed") or elsewhere == "moved"):
+            return                              # a copy, or it is somewhere else in Drive
+        if owner != (self.acc.owner or self.acc.name) or not f.get("ownedByMe") \
+                or self.acc.section not in ("", "my-drive", "backup"):
+            if f.get("trashed") and l.kind == "link" and self.revived.get(p) != l.xid:
+                api.untrash(l.xid)              # can't come here: at least it is not lost (once)
+                self.revived[p] = l.xid
+                self.db.set_meta("revived", json.dumps(self.revived))
+                self.rescued.append(p)
+                log.info("↺ %s: its Google file was in the trash of %s; restored where it was", p, src.title)
+            return
+        folder = self._folder_id(parent(p), R)
+        s = self.S.pop(p, None)
+        if s is not None:                       # its copy as a plain file in Drive: the file itself replaces it
+            R.pop(p, None)
+            rclone(self.acc, "deletefile", self.acc.rpath(s.rname or p))
+        got = api.move_file(l.xid, folder, os.path.basename(os.path.splitext(p)[0] if l.kind == "link" else p),
+                            f.get("parents") or [])
+        if l.kind == "link":
+            R[p] = RItem(p, "gdoc", 0, got.get("modifiedTime", ""), "", l.xid, os.path.splitext(p)[0] + ".desktop",
+                         mime.rsplit(".", 1)[1])
+        else:
+            R[p] = RItem(p, "file", int(got.get("size") or 0), got.get("modifiedTime", ""),
+                         got.get("md5Checksum", "") or "", l.xid, p)
+        if f.get("trashed"):
+            self.rescued.append(p)
+        log.info("⇄ %s came from %s: its Drive item moved here%s", p, src.title,
+                 " (out of the trash)" if f.get("trashed") else "")
+        self.on_event("moved in Drive", p)
+
+    def fetch(self, p: str, l: LItem):
+        """A placeholder that came from elsewhere and was not brought along (a copy, another
+        account's file): its file's content comes down by Drive ID and goes up here as a new file.
+        One whose file Drive doesn't know is just removed."""
+        src = self._root_named(self._pointer_account(l))
+        api = self._drive_of(src) if src else None
+        f = api.get_file(l.xid) if api else None
+        if not f or f.get("mimeType", "").startswith("application/vnd.google-apps."):
+            l.fpath.unlink(missing_ok=True)
+            return
+        final = self.real_path(p)
+        tmp = final.with_name("." + final.name + TMP_EXT)
+        try:
+            api.download(l.xid, tmp)
+            os.replace(tmp, final)
+        finally:
+            tmp.unlink(missing_ok=True)
+        l.fpath.unlink(missing_ok=True)
+        log.info("↓ %s (the file of a placeholder from %s)", p, src.title)
+        self.on_event("download", p)
+        self.upload(p)
+
+    @staticmethod
+    def _pointer_account(l: LItem) -> str:
+        """The sync root that wrote a link or placeholder ('' if it doesn't say)."""
+        try:
+            text = l.fpath.read_text(errors="ignore")[:4096]
+            if l.kind == "link":
+                return json.loads(text).get("account", "") or ""
+            m = re.search(r"\(account '([^']*)'\)", text)
+            return m.group(1) if m else ""
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def _root_named(self, name: str) -> Account | None:
+        if name == self.acc.name:
+            return self.acc
+        return next((r for r in self.siblings if r.name == name), None)
+
+    def _drive_of(self, root: Account):
+        """Drive API by file ID for the account `root` belongs to."""
+        owner = root.owner or root.name
+        if owner == (self.acc.owner or self.acc.name):
+            if self.drive == "auto":
+                self.drive = DriveChanges.for_account(self.acc)
+            return self.drive
+        if owner not in self._drives:
+            self._drives[owner] = DriveChanges.for_account(root)
+        return self._drives[owner]
+
+    def _still_linked(self, fid: str, owner: str) -> str:
+        """Does another synced folder of account `owner` still have Drive item `fid` on disk?
+        'yes' (what came here is a copy), 'moved' (it had it, not any more) or '' (none had it)."""
+        found = ""
+        for root in self.siblings:
+            if root.name == self.acc.name or (root.owner or root.name) != owner or not root.db_path.exists():
+                continue
+            con = sqlite3.connect(root.db_path.as_uri() + "?mode=ro", uri=True, timeout=10)
+            try:
+                rows = con.execute("SELECT path, state FROM files WHERE rid = ?", (fid,)).fetchall()
+            finally:
+                con.close()
+            for path, state in rows:
+                if os.path.lexists(root.local / (path + STUB_EXT if state == "cloud" else path)):
+                    return "yes"
+                found = "moved"
+        return found
+
+    def _folder_id(self, d: str, R: dict[str, RItem]) -> str:
+        """Drive ID of folder `d` of this root, created first if it isn't in Drive yet (it came
+        along with what is being brought here)."""
+        row = self.S.get(d) if d else None
+        if row and row.kind == "dir" and row.rid:
+            return row.rid
+        if d in R and R[d].kind == "dir" and R[d].id:
+            return R[d].id
+        if not d:
+            return self.db.get_meta("root_id") or self._drive_of(self.acc).root_id()
+        rclone(self.acc, "mkdir", self.acc.rpath(d))
+        R[d] = self.stat_remote(d)
+        return R[d].id
+
     # ── the sync
     def sync(self, force: bool = False, dirs: set[str] | None = None, fresh=frozenset(), busy=frozenset()):
         """3-way merge of remote (R), last-synced (S) and local (L) state.
@@ -1258,7 +1422,7 @@ class Engine:
         busy: paths with local events still arriving (e.g. mid-"safe save", when the file is
         briefly missing); nothing is done to them now, they get their own sync once quiet."""
         acc, S = self.acc, self.S
-        self.dupe_stubs, self.deferred, self.restored, self.refused = [], {}, [], []
+        self.dupe_stubs, self.deferred, self.restored, self.refused, self.rescued = [], {}, [], [], []
         denied_before = dict(self.denied)
         files_in_S = sum(1 for r in S.values() if r.kind != "dir")
         if self.backup and not acc.local.is_dir():
@@ -1298,8 +1462,10 @@ class Engine:
             L, Ldirs = self._scan_scope(scope)
             if busy:
                 L, Ldirs = {p: l for p, l in L.items() if p not in busy}, Ldirs - busy
-        # 2. local moves/renames -> server-side move (no re-upload)
+        # 2. local moves/renames -> server-side move (no re-upload); links and placeholders from
+        #    another synced folder bring their Drive item along
         self._apply_local_moves(R, L, Ldirs, scope)
+        self._bring_along(R, L, scope, full=dirs is None)
         self.db.save(S)          # moves already happened on disk and online
 
         now = time.time()
@@ -1348,7 +1514,7 @@ class Engine:
             if (r and r.kind == "gdoc") or (s and s.kind == "gdoc") or (l and l.kind == "link"):
                 if r and r.kind == "gdoc":
                     if l and l.kind == "link":
-                        if not s or l.xid != r.id:
+                        if not s or s.kind != "gdoc" or l.xid != r.id:
                             acts.append(lambda p=p, r=r: self.write_link(p, r))
                         else:
                             S[p] = replace(s, rmtime=r.mtime, rname=r.rname)
@@ -1409,6 +1575,8 @@ class Engine:
                 elif l.kind == "real":
                     if not settling(l):
                         acts.append(lambda p=p, r=r, l=l: self.adopt_or_conflict(p, r, l))
+                elif self.pinned(p):                  # e.g. a placeholder brought into a backed-up folder
+                    acts.append(lambda p=p, r=r: self.download(p, r))
                 else:
                     acts.append(lambda p=p, r=r: self.write_stub(p, r))
             elif s:                                   # deleted on the remote
@@ -1428,8 +1596,8 @@ class Engine:
                         bulk.append(p)
                     elif not settling(l):
                         acts.append(lambda p=p: self.upload(p))
-                else:
-                    acts.append(lambda l=l: l.fpath.unlink(missing_ok=True))
+                else:                                 # a placeholder from elsewhere: its content comes
+                    acts.append(lambda p=p, l=l: self.fetch(p, l))
 
         # many new files (a folder copied in, the first backup): one rclone run per chunk, which
         # also creates the new folders they are in
@@ -1492,6 +1660,10 @@ class Engine:
         if self.refused:
             notify("Google Drive", f"{acc.title}: {len(self.refused)} item(s) stay only on this computer "
                                    f"(e.g. {os.path.basename(self.refused[0])}): no permission or no place in Drive.")
+        if self.rescued:
+            notify("Google Drive", f"{acc.title}: took {len(self.rescued)} item(s) out of the Drive trash "
+                                   f"(e.g. {os.path.basename(self.rescued[0])}): their link or placeholder is in "
+                                   f"this folder.")
         if dirs is None:
             log.info("sync done for %s (%d errors)", acc.title, errors)
         elif steps or errors:
@@ -1817,16 +1989,48 @@ class DriveChanges:
         except urllib.error.HTTPError as e:
             raise ApiError(e.code, e.read()[:300].decode(errors="replace").strip()) from None
 
-    def api(self, path: str, **params) -> dict:
+    def api(self, path: str, method: str = "GET", body: dict | None = None, **params) -> dict:
         url = f"{self.api_base}/{path}?{urllib.parse.urlencode(params)}"
+        data = None if body is None else json.dumps(body).encode()
         for force in (False, True):
-            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + self.access_token(force)})
+            headers = {"Authorization": "Bearer " + self.access_token(force)}
+            if data is not None:
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
                 return self._http(req)
             except ApiError as e:
                 if e.code != 401 or force:
                     raise
         raise AssertionError("unreachable")
+
+    # ── single files by Drive ID (links and placeholders moved between synced folders)
+    FILE_FIELDS = "id,name,mimeType,parents,trashed,ownedByMe,size,md5Checksum,modifiedTime"
+
+    def get_file(self, fid: str) -> dict | None:
+        """The file's metadata, also when it is in the trash; None if Drive doesn't know it (here)."""
+        try:
+            return self.api(f"files/{urllib.parse.quote(fid)}", fields=self.FILE_FIELDS, supportsAllDrives="true")
+        except ApiError as e:
+            if e.code == 404:
+                return None
+            raise
+
+    def move_file(self, fid: str, folder: str, name: str, old_parents: list[str]) -> dict:
+        """Move the file into folder `folder` as `name`, out of the trash if it is there (one call)."""
+        moves = {"addParents": folder} if folder not in old_parents else {}
+        if [p for p in old_parents if p != folder]:
+            moves["removeParents"] = ",".join(p for p in old_parents if p != folder)
+        return self.api(f"files/{urllib.parse.quote(fid)}", method="PATCH", body={"name": name, "trashed": False},
+                        fields=self.FILE_FIELDS, supportsAllDrives="true", **moves)
+
+    def untrash(self, fid: str) -> dict:
+        return self.api(f"files/{urllib.parse.quote(fid)}", method="PATCH", body={"trashed": False},
+                        fields=self.FILE_FIELDS, supportsAllDrives="true")
+
+    def download(self, fid: str, dest: Path):
+        """The file's content into `dest` (also from the trash)."""
+        rclone(self.acc, "backend", "copyid", self.name + ":", fid, str(dest))
 
     # ── the feed
     def _drive_params(self) -> dict:
@@ -2158,9 +2362,10 @@ class Daemon:
     the account's backup is paused; local and Drive changes wait and a full sync follows the resume."""
     QUIET = 2.0             # seconds without new events before a local change is synced
 
-    def __init__(self, acc: Account, changes="auto", board=NO_BOARD):
+    def __init__(self, acc: Account, changes="auto", board=NO_BOARD, siblings: list[Account] | None = None):
         self.acc = acc
         self.board = board                      # StatusBoard of the account's process (gdrive-od-ui)
+        self.siblings = siblings or []          # every sync root (links and placeholders moving between them)
         self.db: DB | None = None               # opened by run(): sqlite objects stay in one thread
         self.eng: Engine | None = None
         self.changes = changes              # DriveChanges | None | "auto"
@@ -2274,6 +2479,7 @@ class Daemon:
     def _engine(self) -> Engine:
         if self.db.changed() or self.eng is None:   # a CLI pin/unpin/sync changed the DB
             self.eng = Engine(self.acc, self.db)
+            self.eng.drive, self.eng.siblings = self.changes, self.siblings
             self.eng.cancelled = lambda: self._stop.is_set() or self.paused()
             self.eng.on_event = lambda kind, path: self.board.event(self.acc.title, kind, path)
             self.eng.on_progress = lambda done, total: self.board.root(
@@ -2502,7 +2708,9 @@ def cmd_sync(accs, args):
         for root in account_roots(acc, refresh=True):
             try:
                 with Locked(root):
-                    Engine(root, DB(root.db_path)).sync(force=args.force)
+                    eng = Engine(root, DB(root.db_path))
+                    eng.siblings = all_roots(accs)
+                    eng.sync(force=args.force)
             except Exception as e:
                 log.error("%s: %s", root.title, e)
                 failed.append(root.title)
@@ -2736,8 +2944,10 @@ def cmd_daemon(accs, args):
         t.start()
         threads.append(t)
 
-    for root in account_roots(acc, refresh=True):
-        start(root.name, Daemon(root, board=board))
+    roots = account_roots(acc, refresh=True)
+    siblings = roots + [r for a in accs.values() if a.name != acc.name for r in account_roots(a)]
+    for root in roots:
+        start(root.name, Daemon(root, board=board, siblings=siblings))
     stop, refresh = threading.Event(), threading.Event()
     threading.Thread(target=board.run, args=(stop,), name="status", daemon=True).start()
 
@@ -2764,7 +2974,8 @@ def cmd_daemon(accs, args):
                 for root in sync_roots(acc, refresh=True):
                     if root.name not in workers:
                         log.info("new Shared drive: %s", root.title)
-                        start(root.name, Daemon(root, board=board))
+                        siblings.append(root)
+                        start(root.name, Daemon(root, board=board, siblings=siblings))
     except KeyboardInterrupt:
         pass
     stop.set()

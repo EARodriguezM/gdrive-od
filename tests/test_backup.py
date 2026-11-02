@@ -1,5 +1,6 @@
 """Backed-up folders of this PC: two-way sync roots <folder> <-> My Drive/Computers/<host>/<folder>
 whose files all stay local (no placeholders), and bulk uploads of many new files."""
+import json
 import os
 import shutil
 import subprocess
@@ -328,3 +329,145 @@ def test_a_copied_link_file_in_my_drive_is_uploaded_not_deleted(env):
     env.sync()
     assert (env.local / "Copy of Plan.gdoc").exists() and (env.remote / "Copy of Plan.gdoc").exists()
     assert (env.local / "Plan.gdoc").exists() and env.rows()["Plan.gdoc"].state == "gdoc"
+
+
+# ── links and placeholders moved in from another synced folder ──────────────
+@pytest.fixture
+def two(backup):
+    """My Drive (without Computers, as with sections) and the backed-up folder, with a Google Doc
+    and an online-only file in My Drive/Work and a folder `sub` in the backup."""
+    env, _, src, dst = backup
+    env.acc = replace(env.acc, exclude=["Computers"])
+    my, bk = roots = GD.account_roots(env.acc)
+    feed = FakeFeed(env)
+    env.put_remote("Work/Plan.desktop", "[Desktop Entry]")      # a Google Doc (fake_rclone)
+    env.put_remote("Work/report.pdf", "PDF")
+    env.put_remote("keep.txt", "k")
+    run(my, feed, roots)
+    run(bk, feed, roots)
+    assert (env.local / "Work/Plan.gdoc").exists() and (env.local / "Work/report.pdf.gdcloud").exists()
+    return env, my, bk, roots, feed, src, dst
+
+
+def run(root, feed, roots, **kw):
+    with GD.Locked(root):
+        eng = GD.Engine(root, GD.DB(root.db_path))
+        eng.drive, eng.siblings = feed, roots
+        eng.sync(**kw)
+    return eng
+
+
+@pytest.mark.parametrize("first", ["my-drive", "backup"])
+def test_a_link_moved_into_a_backed_up_folder_takes_its_google_file_along(two, first):
+    """The case found live: a folder moved from My Drive into Documents. My Drive saw its links
+    gone and trashed the Google files; the links in Documents then pointed into the trash."""
+    env, my, bk, roots, feed, src, dst = two
+    doc = ino(env.remote / "Work/Plan.desktop")
+    os.rename(env.local / "Work/Plan.gdoc", src / "sub/Plan.gdoc")
+    order = [(my, {"Work"}), (bk, {"sub"})]
+    for root, dirs in order if first == "my-drive" else order[::-1]:
+        run(root, feed, roots, dirs=dirs)
+    assert ino(dst / "sub/Plan.desktop") == doc                       # the same Google Doc, moved
+    assert not (env.remote / "Work/Plan.desktop").exists() and not list(feed.drive_trash.rglob("*.desktop"))
+    assert not (dst / "sub/Plan.gdoc").exists()                       # no plain copy of the link
+    assert rows(bk)["sub/Plan.gdoc"].state == "gdoc" and "Work/Plan.gdoc" not in rows(my)
+    assert len(env.calls("deletefile")) == (1 if first == "my-drive" else 0)
+    run(my, feed, roots)
+    run(bk, feed, roots)
+    assert (dst / "sub/Plan.desktop").exists() and not (env.local / "Work/Plan.gdoc").exists()
+    assert GD.Engine.__dict__["_link_id"](src / "sub/Plan.gdoc", (src / "sub/Plan.gdoc").stat()) == doc
+
+
+def test_a_copied_link_stays_a_copy_until_its_google_file_is_in_the_trash(two):
+    """A copy leaves the Google file where it is (the link is backed up as a plain file). Should the
+    original go to the trash later, the full sync brings it here: the link to it is still here.
+    That is also how the copies the one-way backup made are repaired."""
+    env, my, bk, roots, feed, src, dst = two
+    doc = ino(env.remote / "Work/Plan.desktop")
+    shutil.copy(env.local / "Work/Plan.gdoc", src / "sub/Plan.gdoc")
+    run(bk, feed, roots, dirs={"sub"})
+    assert ino(env.remote / "Work/Plan.desktop") == doc and (dst / "sub/Plan.gdoc").exists()
+    assert rows(bk)["sub/Plan.gdoc"].state == "local"
+    (env.local / "Work/Plan.gdoc").unlink()
+    run(my, feed, roots, dirs={"Work"})                               # -> Drive trash
+    run(bk, feed, roots, dirs={"sub"})                                # targeted: not looked at
+    assert not (dst / "sub/Plan.desktop").exists()
+    eng = run(bk, feed, roots)
+    assert ino(dst / "sub/Plan.desktop") == doc and not (dst / "sub/Plan.gdoc").exists()
+    assert rows(bk)["sub/Plan.gdoc"].state == "gdoc" and eng.rescued == ["sub/Plan.gdoc"]
+    assert (src / "sub/Plan.gdoc").exists() and not list(feed.drive_trash.rglob("*.desktop"))
+    assert [p.name for p in feed.drive_trash.rglob("Plan.gdoc")] == ["Plan.gdoc"]   # the plain copy
+
+
+def test_a_placeholder_moved_into_a_backed_up_folder_brings_its_file(two):
+    env, my, bk, roots, feed, src, dst = two
+    fid = ino(env.remote / "Work/report.pdf")
+    os.rename(env.local / "Work/report.pdf.gdcloud", src / "sub/report.pdf.gdcloud")
+    run(my, feed, roots, dirs={"Work"})                               # -> Drive trash
+    run(bk, feed, roots, dirs={"sub"})
+    assert ino(dst / "sub/report.pdf") == fid and (src / "sub/report.pdf").read_text() == "PDF"
+    assert not (src / "sub/report.pdf.gdcloud").exists() and rows(bk)["sub/report.pdf"].state == "local"
+    assert not env.calls("copy") and not [c for c in env.calls("copyto") if c[1] == str(src / "sub/report.pdf")]
+
+
+def test_a_copied_placeholder_brings_a_copy_of_the_file(two):
+    env, my, bk, roots, feed, src, dst = two
+    fid = ino(env.remote / "Work/report.pdf")
+    shutil.copy(env.local / "Work/report.pdf.gdcloud", src / "sub/report.pdf.gdcloud")
+    run(bk, feed, roots, dirs={"sub"})
+    assert (src / "sub/report.pdf").read_text() == "PDF" and not (src / "sub/report.pdf.gdcloud").exists()
+    assert (dst / "sub/report.pdf").read_text() == "PDF" and ino(dst / "sub/report.pdf") != fid
+    assert ino(env.remote / "Work/report.pdf") == fid and (env.local / "Work/report.pdf.gdcloud").exists()
+
+
+def test_a_folder_moved_in_creates_its_folder_for_what_it_brings(two):
+    env, my, bk, roots, feed, src, dst = two
+    doc = ino(env.remote / "Work/Plan.desktop")
+    os.rename(env.local / "Work", src / "Moved")
+    run(my, feed, roots)
+    run(bk, feed, roots)
+    assert ino(dst / "Moved/Plan.desktop") == doc and (dst / "Moved/report.pdf").read_text() == "PDF"
+    assert (src / "Moved/report.pdf").read_text() == "PDF" and not list(src.rglob("*.gdcloud"))
+    assert rows(bk)["Moved"].rid == ino(dst / "Moved")
+
+
+def test_another_accounts_google_file_is_taken_out_of_the_trash_where_it_was_once(two, tmp_path):
+    env, my, bk, roots, feed, src, dst = two
+    other = GD.Account(name="u", remote=str(env.remote), local=tmp_path / "U")
+    doc = ino(env.remote / "Work/Plan.desktop")
+    link = json.loads((env.local / "Work/Plan.gdoc").read_text())
+    (src / "sub/Plan.gdoc").write_text(json.dumps(dict(link, account="u")))
+    subprocess.run([str(GD.RCLONE), "deletefile", str(env.remote / "Work/Plan.desktop")], check=True)
+
+    def full_sync():
+        with GD.Locked(bk):
+            eng = GD.Engine(bk, GD.DB(bk.db_path))
+            eng.drive, eng.siblings, eng._drives = None, [*roots, other], {"u": feed}
+            eng.sync()
+        return eng
+    assert full_sync().rescued == ["sub/Plan.gdoc"]
+    assert ino(env.remote / "Work/Plan.desktop") == doc               # back where it was, in its account
+    subprocess.run([str(GD.RCLONE), "deletefile", str(env.remote / "Work/Plan.desktop")], check=True)
+    assert full_sync().rescued == [] and not (env.remote / "Work/Plan.desktop").exists()   # deleted again: stays
+
+
+def test_daemons_bring_a_moved_link_along(two):
+    env, my, bk, roots, feed, src, dst = two
+    doc = ino(env.remote / "Work/Plan.desktop")
+    ds = [GD.Daemon(my, changes=FakeFeed(env), siblings=roots), GD.Daemon(bk, changes=BackupFeed(env, dst), siblings=roots)]
+    threads = []
+    for d in ds:
+        d.QUIET = 0.3
+        threads.append(threading.Thread(target=d.run, daemon=True))
+        threads[-1].start()
+    try:
+        time.sleep(1.5)                                               # first full syncs
+        os.rename(env.local / "Work/Plan.gdoc", src / "sub/Plan.gdoc")
+        wait_for(lambda: (dst / "sub/Plan.desktop").exists(), 15, "doc moved into the backup")
+        wait_for(lambda: "Work/Plan.gdoc" not in rows(my), 15, "My Drive forgot it")
+        assert ino(dst / "sub/Plan.desktop") == doc and not list(feed.drive_trash.rglob("*.desktop"))
+    finally:
+        for d in ds:
+            d.stop()
+        for t in threads:
+            t.join(15)

@@ -26,6 +26,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("GDOD_NO_NOTIFY", "1")
     monkeypatch.setenv("GDOD_REAL_RCLONE", REAL_RCLONE)
     monkeypatch.setenv("GDOD_RCLONE_LOG", str(log))
+    monkeypatch.setenv("GDOD_FAKE_TRASH", str(tmp_path / "drive-trash"))
     monkeypatch.setenv("RCLONE_CONFIG", str(tmp_path / "rclone.conf"))     # never the user's config
     monkeypatch.setattr(GD, "STATE_DIR", state)
     monkeypatch.setattr(GD, "RCLONE", str(FAKE_RCLONE))

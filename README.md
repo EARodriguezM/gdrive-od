@@ -174,6 +174,14 @@ are kept. If the Tags column stays empty, enable *File Search* for that folder i
 trash** (Google keeps it 30 days). To free disk space without deleting, use *Free up space*.
 Something deleted on drive.google.com is moved to your **local trash**.
 
+**Moving between synced folders** (My Drive, a backed-up folder, another section): a placeholder
+or Google file link takes its Drive item along. It is moved in Drive to the same place, and taken
+out of the Drive trash if the folder it left had already put it there. In a backed-up folder a
+placeholder then downloads. A **copy** of a placeholder brings a copy of the file. A copy of a
+link stays a link to the same Google file (synced as a plain file). If that Google file later goes
+to the trash, the next full check moves it next to the link. Moving placeholders or links anywhere
+else (outside every synced folder) still deletes them from Drive: they hold no data themselves.
+
 ## Sections: My Drive, Shared with me, Shared drives, Computers
 
 With `sections = true` (the default for `add-account`), an account folder mirrors the Drive
@@ -351,6 +359,9 @@ attributes `user.gdrive.id` and `user.gdrive.path`. **Google file links:** JSON 
 - **Files being saved are left alone.** A path whose events are still arriving (an editor's
   "safe save" removes the file for a moment) is never taken as deleted.
 - **Shared content:** items you don't own are never deleted or moved from *Shared with me*.
+- **Links and placeholders are never orphaned** by a move into another synced folder: their Drive
+  item follows them, out of the trash if need be (see [Daily use](#daily-use)). A Google file of
+  another account is restored where it was (once; deleted again, it stays deleted).
 - **Restarts are safe:** stopping a service finishes the current step. An interrupted transfer is
   redone on the next sync.
 
